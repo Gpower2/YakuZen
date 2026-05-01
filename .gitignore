@@ -1,0 +1,33 @@
+# Python caches and build outputs
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+pip-wheel-metadata/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Editor and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local runtime/model caches
+src/temp/
+temp/
+
+# Local sample data and generated media/subtitle artifacts
+sample/
+*.mkv
+*.mp4
+*.avi
+*.mov
+*.wav
+*.srt
+*.ckpt

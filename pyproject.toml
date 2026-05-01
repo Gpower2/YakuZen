@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "yakuzen"
+version = "0.1.0"
+description = "Desktop anime subtitling pipeline using local speech-to-text and Ollama translation"
+readme = "README.md"
+requires-python = ">=3.10,<3.13"
+dependencies = [
+  "audio-separator",
+  "customtkinter",
+  "cutlet",
+  "faster-whisper",
+  "onnxruntime-gpu",
+  "requests",
+  "torch",
+  "tqdm",
+  "unidic-lite",
+]
+
+[tool.setuptools]
+packages = []
+
+# Non-Python runtime dependencies still required outside this file:
+# - ffmpeg available on PATH
+# - Ollama running locally at http://localhost:11434
+# - A downloaded Ollama model that matches src\translate_subs.py (currently qwen3:14b)
+# - A CUDA-capable NVIDIA environment for the current Whisper/ONNX settings
