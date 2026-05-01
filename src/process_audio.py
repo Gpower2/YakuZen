@@ -13,6 +13,7 @@ from datetime import timedelta
 from tqdm import tqdm
 import cutlet
 import stable_whisper
+import torch
 from audio_separator.separator import Separator
 
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -89,6 +90,11 @@ def save_srt(subtitles, output_path, text_key):
 
 def clamp_timestamp(value, duration):
     return max(0.0, min(float(value), duration))
+
+def get_whisper_runtime():
+    if torch.cuda.is_available():
+        return "cuda", "float16"
+    return "cpu", "int8"
 
 def refine_subtitle_timings(model, audio_path, subtitles, duration):
     print(json.dumps({"status": "refining_timestamps"}), file=sys.stderr)
@@ -200,7 +206,12 @@ def main(input_file):
         extract_alignment_audio(input_file, alignment_audio_path)
     alignment_duration = get_audio_duration(alignment_audio_path)
 
-    model = stable_whisper.load_faster_whisper("large-v3", device="cuda", compute_type="float16")
+    whisper_device, whisper_compute_type = get_whisper_runtime()
+    model = stable_whisper.load_faster_whisper(
+        "large-v3",
+        device=whisper_device,
+        compute_type=whisper_compute_type,
+    )
 
     katsu = cutlet.Cutlet() 
     
@@ -326,6 +337,8 @@ def main(input_file):
     output_meta["timing_refiner"] = "stable-ts-align_words"
     output_meta["timing_refinement_version"] = TIMING_REFINEMENT_VERSION
     output_meta["timing_alignment_audio"] = "mixed_track_mono_16k"
+    output_meta["whisper_device"] = whisper_device
+    output_meta["whisper_compute_type"] = whisper_compute_type
     output_meta["transcription_model"] = output_meta.get("transcription_model", cached_meta.get("model", "large-v3-faster-raw"))
     if info is not None:
         output_meta["language"] = info.language

@@ -31,45 +31,154 @@ The English export has two forms: `.en.raw.srt` keeps the original segment timin
 
 ## Dependencies
 
-The repository currently does not include `requirements.txt` or `pyproject.toml`, so the dependency list below is inferred from the source code.
+Python dependencies are declared in `pyproject.toml`.
 
 ### Python packages
 
+- `audio-separator`
 - `customtkinter`
-- `requests`
-- `tqdm`
 - `cutlet`
 - `faster-whisper`
-- `stable-ts`
-- `audio-separator`
+- `onnxruntime-gpu` on Windows/Linux, `onnxruntime` on macOS
+- `requests`
+- `stable-ts[fw]`
 - `torch`
-- `onnxruntime-gpu`
+- `tqdm`
 - `unidic-lite`
 
 ### External tools and services
 
-- `ffmpeg` available on `PATH`
+- `ffmpeg` and `ffprobe` available on `PATH`
 - Ollama running locally on `http://localhost:11434`
 - A local Ollama model downloaded in advance; `translate_subs.py` currently defaults to `qwen3:14b`
 - `audio_separator` model assets cached/downloaded under `.\temp`
 
-### Runtime assumptions
+## Platform support
 
-- A CUDA-capable GPU is effectively part of the current pipeline because `process_audio.py` hard-codes `device="cuda"` and `compute_type="float16"`
-- `tkinter` is used for the native file dialogs and message boxes
-- The GUI should be launched from `src\` because it starts `process_audio.py` and `translate_subs.py` by bare filename
-- Existing subtitle JSON caches without the current timing-refinement version are treated as upgradeable transcripts: the app can reuse the cached text and rerun only the timing-refinement stage
+| OS | Status | Notes |
+|---|---|---|
+| Windows | Best-supported path | This is the environment the project has been exercised in most heavily. NVIDIA CUDA is strongly recommended. |
+| Linux | Supported | NVIDIA CUDA is strongly recommended. CPU-only runs are possible but slow. |
+| macOS | Supported with CPU fallback | `process_audio.py` now falls back to CPU `int8` Whisper when CUDA is unavailable. Expect much slower transcription/alignment than on an NVIDIA machine. |
+
+Across all operating systems, launch the GUI from the `src` directory because `app.py` starts sibling scripts by bare filename.
+
+Existing subtitle JSON caches without the current timing-refinement version are treated as upgradeable transcripts: the app can reuse the cached text and rerun only the timing-refinement stage.
+
+## Installing dependencies
+
+### Windows
+
+1. Install system dependencies:
+   ```powershell
+   winget install Gyan.FFmpeg.Essentials
+   winget install Ollama.Ollama
+   ```
+2. Create and activate a virtual environment:
+   ```powershell
+   py -3.12 -m venv .venv
+   .\.venv\Scripts\Activate.ps1
+   python -m pip install --upgrade pip
+   pip install -e .
+   ```
+3. If you want GPU acceleration for Whisper and `torch.cuda.is_available()` is still `False`, reinstall PyTorch with a CUDA wheel that matches your system. Example for CUDA 12.8:
+   ```powershell
+   pip install --force-reinstall torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+   ```
+4. Start Ollama and pull the translation model:
+   ```powershell
+   ollama pull qwen3:14b
+   ```
+
+### Linux
+
+1. Install system dependencies. Example for Debian/Ubuntu:
+   ```bash
+   sudo apt update
+   sudo apt install -y ffmpeg python3 python3-venv python3-tk curl
+   curl -fsSL https://ollama.com/install.sh | sh
+   ```
+2. Create and activate a virtual environment:
+   ```bash
+   python3 -m venv .venv
+   source .venv/bin/activate
+   python -m pip install --upgrade pip
+   pip install -e .
+   ```
+3. If you want NVIDIA GPU acceleration, install a CUDA-enabled PyTorch build that matches your driver/CUDA stack. Example for CUDA 12.8:
+   ```bash
+   pip install --force-reinstall torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+   ```
+4. Start Ollama if it is not already running, then pull the model:
+   ```bash
+   ollama serve
+   ollama pull qwen3:14b
+   ```
+
+### macOS
+
+1. Install system dependencies:
+   ```bash
+   brew install python@3.12 ffmpeg ollama
+   ```
+2. Create and activate a virtual environment:
+   ```bash
+   python3 -m venv .venv
+   source .venv/bin/activate
+   python -m pip install --upgrade pip
+   pip install -e .
+   ```
+3. Start Ollama and pull the model:
+   ```bash
+   ollama serve
+   ollama pull qwen3:14b
+   ```
+4. Expect the audio pipeline to run on CPU unless you adapt the project to a different backend; the committed code now handles that fallback automatically.
 
 ## Running the app
 
+### Windows
+
 ```powershell
+.\.venv\Scripts\Activate.ps1
 Set-Location src
 python app.py
 ```
 
-To check the local GPU stack before running the full pipeline:
+### Linux
+
+```bash
+source .venv/bin/activate
+cd src
+python app.py
+```
+
+### macOS
+
+```bash
+source .venv/bin/activate
+cd src
+python app.py
+```
+
+## Running the worker scripts directly
+
+### Windows
 
 ```powershell
+.\.venv\Scripts\Activate.ps1
 Set-Location src
+python process_audio.py ..\sample\Blue.Noah.1979.S01E01.AMZN.WEBRip.BK.mkv
+python translate_subs.py ..\sample\Blue.Noah.1979.S01E01.AMZN.WEBRip.BK.json
+python check_gpu.py
+```
+
+### Linux / macOS
+
+```bash
+source .venv/bin/activate
+cd src
+python process_audio.py ../sample/Blue.Noah.1979.S01E01.AMZN.WEBRip.BK.mkv
+python translate_subs.py ../sample/Blue.Noah.1979.S01E01.AMZN.WEBRip.BK.json
 python check_gpu.py
 ```
