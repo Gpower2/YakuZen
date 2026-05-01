@@ -239,6 +239,39 @@ def translate_batch_robust(current_lines, previous_context_lines):
 
     return [{"en": txt} for txt in cleaned_results]
 
+def sync_translated_cache(source_data, translated_data):
+    source_subs = source_data.get("subtitles", [])
+    translated_subs = translated_data.get("subtitles", [])
+
+    if len(source_subs) != len(translated_subs):
+        return None, False
+
+    synced_subs = []
+    timings_changed = False
+
+    for source_sub, translated_sub in zip(source_subs, translated_subs):
+        if source_sub.get("text_jp") != translated_sub.get("text_jp"):
+            return None, False
+
+        if (
+            source_sub.get("start") != translated_sub.get("start")
+            or source_sub.get("end") != translated_sub.get("end")
+            or source_sub.get("text_romaji") != translated_sub.get("text_romaji")
+        ):
+            timings_changed = True
+
+        synced_sub = dict(translated_sub)
+        synced_sub["start"] = source_sub["start"]
+        synced_sub["end"] = source_sub["end"]
+        synced_sub["text_jp"] = source_sub["text_jp"]
+        synced_sub["text_romaji"] = source_sub.get("text_romaji", translated_sub.get("text_romaji", ""))
+        synced_subs.append(synced_sub)
+
+    synced_data = dict(translated_data)
+    synced_data["meta"] = source_data.get("meta", translated_data.get("meta", {}))
+    synced_data["subtitles"] = synced_subs
+    return synced_data, timings_changed
+
 def main(input_json_file):
     if not os.path.exists(input_json_file):
         print(f"Error: File {input_json_file} not found.")
@@ -247,19 +280,35 @@ def main(input_json_file):
     base_name = os.path.splitext(input_json_file)[0]
     translated_json_path = f"{base_name}_translated.json"
 
+    with open(input_json_file, 'r', encoding='utf-8') as f:
+        source_data = json.load(f)
+
+    data = source_data
+    original_subs = source_data['subtitles']
+    needs_translation = True
+
     # --- 1. CACHE CHECK ---
     if os.path.exists(translated_json_path):
-        print("\n[!] CACHE LOADED: Translated JSON found. Skipping Ollama generation.\n")
         with open(translated_json_path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-        original_subs = data['subtitles']
-        
-    else:
+            translated_data = json.load(f)
+
+        synced_cache, timings_changed = sync_translated_cache(source_data, translated_data)
+        if synced_cache is not None:
+            data = synced_cache
+            original_subs = data['subtitles']
+            needs_translation = False
+
+            if timings_changed:
+                print("\n[!] CACHE UPDATED: Reused translations and pulled latest subtitle timings from source JSON.\n")
+                with open(translated_json_path, "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+            else:
+                print("\n[!] CACHE LOADED: Translated JSON found. Skipping Ollama generation.\n")
+        else:
+            print("\n[!] CACHE INVALIDATED: Transcript text changed. Regenerating translations.\n")
+
+    if needs_translation:
         # --- 2. TRANSLATION LOOP ---
-        with open(input_json_file, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-        
-        original_subs = data['subtitles']
         total_subs = len(original_subs)
 
         print(f"Translating {total_subs} lines (Robust V2 + Auto-Formatter).")

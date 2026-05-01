@@ -17,6 +17,7 @@ YakuZen is a desktop subtitle-generation app for Japanese anime video files. It 
    - Separates the vocal stem with `audio_separator`
    - Normalizes the stem with FFmpeg loudness normalization and resamples it to 16 kHz
    - Transcribes Japanese speech with `faster-whisper` `large-v3` on CUDA
+   - Runs a second-pass timing refinement with `stable-ts align_words()` against a cached mono 16 kHz extract of the original episode mix to tighten subtitle boundaries without changing the subtitle count
    - Converts the Japanese transcript to phonetic romaji with `cutlet`
    - Writes `<base>.json`, `<base>.kanji.srt`, `<base>.romaji.srt`, and `<base>_debug_raw.json`
 3. `src\translate_subs.py` handles translation and final export:
@@ -39,6 +40,7 @@ The repository currently does not include `requirements.txt` or `pyproject.toml`
 - `tqdm`
 - `cutlet`
 - `faster-whisper`
+- `stable-ts`
 - `audio-separator`
 - `torch`
 - `onnxruntime-gpu`
@@ -56,6 +58,7 @@ The repository currently does not include `requirements.txt` or `pyproject.toml`
 - A CUDA-capable GPU is effectively part of the current pipeline because `process_audio.py` hard-codes `device="cuda"` and `compute_type="float16"`
 - `tkinter` is used for the native file dialogs and message boxes
 - The GUI should be launched from `src\` because it starts `process_audio.py` and `translate_subs.py` by bare filename
+- Existing subtitle JSON caches without the current timing-refinement version are treated as upgradeable transcripts: the app can reuse the cached text and rerun only the timing-refinement stage
 
 ## Running the app
 

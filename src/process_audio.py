@@ -12,13 +12,15 @@ import re
 from datetime import timedelta
 from tqdm import tqdm
 import cutlet
-from faster_whisper import WhisperModel
+import stable_whisper
 from audio_separator.separator import Separator
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
 # --- CONFIGURATION ---
 TEMP_DIR = os.path.abspath("./temp")
+TIMING_REFINEMENT_VAD_THRESHOLD = 0.35
+TIMING_REFINEMENT_VERSION = 2
 
 def get_audio_duration(file_path):
     try:
@@ -65,6 +67,15 @@ def normalize_audio(input_path, output_path, duration):
                 
     process.wait()
 
+def extract_alignment_audio(input_path, output_path):
+    print(json.dumps({"status": "extracting_alignment_audio"}), file=sys.stderr)
+
+    command = [
+        "ffmpeg", "-y", "-i", input_path,
+        "-vn", "-ac", "1", "-ar", "16000", output_path
+    ]
+    subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
 def save_srt(subtitles, output_path, text_key):
     srt_output = []
     for idx, sub in enumerate(subtitles, 1):
@@ -75,6 +86,52 @@ def save_srt(subtitles, output_path, text_key):
     
     with open(output_path, "w", encoding="utf-8") as f:
         f.write("\n".join(srt_output))
+
+def clamp_timestamp(value, duration):
+    return max(0.0, min(float(value), duration))
+
+def refine_subtitle_timings(model, audio_path, subtitles, duration):
+    print(json.dumps({"status": "refining_timestamps"}), file=sys.stderr)
+
+    alignment_segments = [
+        {
+            "start": sub["start"],
+            "end": sub["end"],
+            "text": sub["text_jp"]
+        }
+        for sub in subtitles
+    ]
+
+    refined_result = model.align_words(
+        audio_path,
+        alignment_segments,
+        language="ja",
+        vad=True,
+        vad_threshold=TIMING_REFINEMENT_VAD_THRESHOLD,
+        suppress_silence=True,
+        suppress_word_ts=True,
+        regroup=False,
+        verbose=False,
+        inplace=False,
+    )
+
+    if len(refined_result.segments) != len(subtitles):
+        raise ValueError(
+            f"Timestamp refinement changed segment count: {len(subtitles)} -> {len(refined_result.segments)}"
+        )
+
+    refined_subtitles = []
+    for original, refined in zip(subtitles, refined_result.segments):
+        start = round(clamp_timestamp(refined.start, duration), 3)
+        end = round(max(start, clamp_timestamp(refined.end, duration)), 3)
+
+        refined_subtitles.append({
+            **original,
+            "start": start,
+            "end": end,
+        })
+
+    return refined_subtitles
 
 def main(input_file):
     start_time = time.time()
@@ -89,14 +146,27 @@ def main(input_file):
     output_srt_romaji = os.path.join(dir_name, f"{base_name}.romaji.srt")
     output_srt_kanji = os.path.join(dir_name, f"{base_name}.kanji.srt")
     debug_json_path = os.path.join(dir_name, f"{base_name}_debug_raw.json")
+    cached_data = None
+    cached_meta = {}
+    results = None
+    info = None
 
     if os.path.exists(output_json_path):
-        print("\n[!] CACHE LOADED: Delete the .json file to process fresh.\n", file=sys.stderr)
         with open(output_json_path, "r", encoding="utf-8") as f:
             cached_data = json.load(f)
+
+        cached_meta = cached_data.get("meta", {})
+        if cached_meta.get("timing_refinement_version", 0) >= TIMING_REFINEMENT_VERSION:
+            print("\n[!] CACHE LOADED: Refined JSON found. Skipping transcription.\n", file=sys.stderr)
             save_srt(cached_data["subtitles"], output_srt_romaji, "text_romaji")
             save_srt(cached_data["subtitles"], output_srt_kanji, "text_jp")
-        return
+            return
+
+        if cached_meta.get("timing_refined"):
+            print("\n[!] CACHE LOADED: Older refined JSON found. Reusing transcript and upgrading timings.\n", file=sys.stderr)
+        else:
+            print("\n[!] CACHE LOADED: Existing JSON found. Reusing transcript and upgrading timings.\n", file=sys.stderr)
+        results = cached_data["subtitles"]
 
     os.makedirs(TEMP_DIR, exist_ok=True)
     
@@ -125,87 +195,12 @@ def main(input_file):
     if not os.path.exists(normalized_vocals_path):
         normalize_audio(raw_vocals_path, normalized_vocals_path, duration)
 
-    # 3. TRANSCRIBE
-    print(json.dumps({"status": "transcribing"}), file=sys.stderr)
-    model = WhisperModel("large-v3", device="cuda", compute_type="float16")
-    
-    segments_generator, info = model.transcribe(
-        normalized_vocals_path, 
-        
-        # language
-        # Default: None (Auto-detect)
-        # Description: The language of the audio.
-        # Reasoning: Forced to "ja" to skip the detection phase and prevent the AI from arbitrarily switching languages mid-episode.
-        language="ja", 
-        
-        # beam_size
-        # Default: 5
-        # Description: Number of parallel paths the AI evaluates to find the most accurate translation.
-        # Reasoning: Kept at 5. Offers the best balance between high accuracy and VRAM usage.
-        beam_size=5,    
-        
-        # patience
-        # Default: 1.0
-        # Description: How long the beam search waits to finalize a complex sentence path.
-        # Reasoning: Kept at 1.0. Ensures high logical accuracy on long anime monologues.
-        patience=1.0,   
-        
-        # condition_on_previous_text
-        # Default: True
-        # Description: Feeds the previously transcribed text into the current window to provide context.
-        # Reasoning: Set to False. Anime has long musical/silent breaks. Context windowing causes the AI to hallucinate and repeat the previous line endlessly during silences.
-        condition_on_previous_text=False, 
-        
-        # initial_prompt
-        # Default: None
-        # Description: A string of text fed to the AI before it starts transcribing.
-        # Reasoning: Subliminally forces the AI to use proper Japanese punctuation (。、) and permits it to output English characters (Hello) for loan words.
-        initial_prompt="こんにちは。Hello。今日はいい天気ですね。", 
-        
-        # vad_filter
-        # Default: False
-        # Description: Enables Silero Voice Activity Detection to skip silent parts of the audio.
-        # Reasoning: Set to True. Starves the AI of static and tape hiss, drastically reducing hallucinations.
-        vad_filter=True,
-        
-        vad_parameters=dict(
-            # threshold
-            # Default: 0.5
-            # Description: Confidence threshold (0.0 to 1.0) for detecting speech.
-            # Reasoning: Back to default 0.5. 0.4 was too sensitive and allowed room tone to bridge gaps between words.
-            threshold=0.5,                
-            
-            # min_speech_duration_ms
-            # Default: 250
-            # Description: Minimum length of a sound to be considered speech.
-            # Reasoning: Kept at 250ms. Prevents random micro-noises (door clicks, footsteps) from triggering transcription.
-            min_speech_duration_ms=250,   
-            
-            # min_silence_duration_ms
-            # Default: 2000
-            # Description: How much silence must occur before the VAD cuts a segment.
-            # Reasoning: TIGHTENED to 500ms. 1000ms was too long, causing the VAD to stretch subtitles across long pauses. Half a second is a natural boundary.
-            min_silence_duration_ms=500, 
-            
-            # speech_pad_ms
-            # Default: 400
-            # Description: Extra audio buffer added before and after detected speech.
-            # Reasoning: TIGHTENED to 150ms. 400ms artificially inflated the visual duration of the subtitle. 150ms is just enough to catch the trailing breath without lingering on screen.
-            speech_pad_ms=150             
-        ),
-        
-        # word_timestamps
-        # Default: False
-        # Description: Uses Dynamic Time Warping (DTW) to calculate millisecond timings for individual words.
-        # Reasoning: STRICTLY FALSE. DTW fundamentally misunderstands Japanese trailing vowels and shrinks boundaries or snaps to static. We are relying entirely on the VAD segment bounds.
-        word_timestamps=False, 
-        
-        # hallucination_silence_threshold
-        # Default: None
-        # Description: Drops transcriptions if they are stretched across massive silences.
-        # Reasoning: Set to 2.0s. Failsafe to prevent the "Early Anchor" bug where a word is artificially snapped 10 seconds early to background noise.
-        hallucination_silence_threshold=2.0 
-    )
+    alignment_audio_path = os.path.join(TEMP_DIR, f"alignment_{base_name}.wav")
+    if not os.path.exists(alignment_audio_path):
+        extract_alignment_audio(input_file, alignment_audio_path)
+    alignment_duration = get_audio_duration(alignment_audio_path)
+
+    model = stable_whisper.load_faster_whisper("large-v3", device="cuda", compute_type="float16")
 
     katsu = cutlet.Cutlet() 
     
@@ -215,40 +210,131 @@ def main(input_file):
     # Reasoning: Set to False. We want pure phonetic Romaji (paatii) so the text perfectly matches the sounds coming out of the characters' mouths.
     katsu.use_foreign_spelling = False 
 
-    results = []
     raw_segments_debug = []
-    
-    with tqdm(total=duration, unit='s', desc="Transcribing", file=sys.stderr) as pbar:
-        for segment in segments_generator:
-            raw_segments_debug.append({
-                "start": segment.start,
-                "end": segment.end,
-                "text": segment.text
-            })
+    if results is None:
+        results = []
 
-            text_jp = segment.text.replace(" ", "").strip()
-            if text_jp:
-                results.append({
-                    "start": round(segment.start, 3),
-                    "end": round(segment.end, 3),
-                    "text_jp": text_jp,
-                    "text_romaji": katsu.romaji(text_jp).strip()
+        # 3. TRANSCRIBE
+        print(json.dumps({"status": "transcribing"}), file=sys.stderr)
+        segments_generator, info = model.transcribe(
+            normalized_vocals_path, 
+            
+            # language
+            # Default: None (Auto-detect)
+            # Description: The language of the audio.
+            # Reasoning: Forced to "ja" to skip the detection phase and prevent the AI from arbitrarily switching languages mid-episode.
+            language="ja", 
+            
+            # beam_size
+            # Default: 5
+            # Description: Number of parallel paths the AI evaluates to find the most accurate translation.
+            # Reasoning: Kept at 5. Offers the best balance between high accuracy and VRAM usage.
+            beam_size=5,    
+            
+            # patience
+            # Default: 1.0
+            # Description: How long the beam search waits to finalize a complex sentence path.
+            # Reasoning: Kept at 1.0. Ensures high logical accuracy on long anime monologues.
+            patience=1.0,   
+            
+            # condition_on_previous_text
+            # Default: True
+            # Description: Feeds the previously transcribed text into the current window to provide context.
+            # Reasoning: Set to False. Anime has long musical/silent breaks. Context windowing causes the AI to hallucinate and repeat the previous line endlessly during silences.
+            condition_on_previous_text=False, 
+            
+            # initial_prompt
+            # Default: None
+            # Description: A string of text fed to the AI before it starts transcribing.
+            # Reasoning: Subliminally forces the AI to use proper Japanese punctuation (。、) and permits it to output English characters (Hello) for loan words.
+            initial_prompt="こんにちは。Hello。今日はいい天気ですね。", 
+            
+            # vad_filter
+            # Default: False
+            # Description: Enables Silero Voice Activity Detection to skip silent parts of the audio.
+            # Reasoning: Set to True. Starves the AI of static and tape hiss, drastically reducing hallucinations.
+            vad_filter=True,
+            
+            vad_parameters=dict(
+                # threshold
+                # Default: 0.5
+                # Description: Confidence threshold (0.0 to 1.0) for detecting speech.
+                # Reasoning: Back to default 0.5. 0.4 was too sensitive and allowed room tone to bridge gaps between words.
+                threshold=0.5,                
+                
+                # min_speech_duration_ms
+                # Default: 250
+                # Description: Minimum length of a sound to be considered speech.
+                # Reasoning: Kept at 250ms. Prevents random micro-noises (door clicks, footsteps) from triggering transcription.
+                min_speech_duration_ms=250,   
+                
+                # min_silence_duration_ms
+                # Default: 2000
+                # Description: How much silence must occur before the VAD cuts a segment.
+                # Reasoning: TIGHTENED to 500ms. 1000ms was too long, causing the VAD to stretch subtitles across long pauses. Half a second is a natural boundary.
+                min_silence_duration_ms=500, 
+                
+                # speech_pad_ms
+                # Default: 400
+                # Description: Extra audio buffer added before and after detected speech.
+                # Reasoning: TIGHTENED to 150ms. 400ms artificially inflated the visual duration of the subtitle. 150ms is just enough to catch the trailing breath without lingering on screen.
+                speech_pad_ms=150             
+            ),
+            
+            # word_timestamps
+            # Default: False
+            # Description: Uses Dynamic Time Warping (DTW) to calculate millisecond timings for individual words.
+            # Reasoning: STRICTLY FALSE. DTW fundamentally misunderstands Japanese trailing vowels and shrinks boundaries or snaps to static. We are relying entirely on the VAD segment bounds.
+            word_timestamps=False, 
+            
+            # hallucination_silence_threshold
+            # Default: None
+            # Description: Drops transcriptions if they are stretched across massive silences.
+            # Reasoning: Set to 2.0s. Failsafe to prevent the "Early Anchor" bug where a word is artificially snapped 10 seconds early to background noise.
+            hallucination_silence_threshold=2.0 
+        )
+
+        with tqdm(total=duration, unit='s', desc="Transcribing", file=sys.stderr) as pbar:
+            for segment in segments_generator:
+                raw_segments_debug.append({
+                    "start": segment.start,
+                    "end": segment.end,
+                    "text": segment.text
                 })
-            pbar.update(segment.end - pbar.n)
 
-    print(json.dumps({"status": "saving_debug", "file": debug_json_path}), file=sys.stderr)
-    with open(debug_json_path, "w", encoding="utf-8") as f:
-        json.dump(raw_segments_debug, f, ensure_ascii=False, indent=2)
+                text_jp = segment.text.replace(" ", "").strip()
+                if text_jp:
+                    results.append({
+                        "start": round(segment.start, 3),
+                        "end": round(segment.end, 3),
+                        "text_jp": text_jp,
+                        "text_romaji": katsu.romaji(text_jp).strip()
+                    })
+                pbar.update(segment.end - pbar.n)
+
+        print(json.dumps({"status": "saving_debug", "file": debug_json_path}), file=sys.stderr)
+        with open(debug_json_path, "w", encoding="utf-8") as f:
+            json.dump(raw_segments_debug, f, ensure_ascii=False, indent=2)
+
+    results = refine_subtitle_timings(model, alignment_audio_path, results, alignment_duration)
 
     total_time = time.time() - start_time
-    
+    output_meta = dict(cached_meta)
+    output_meta["processing_time"] = round(total_time, 2)
+    output_meta["model"] = "large-v3-faster-stable-ts-align_words"
+    output_meta["timing_refined"] = True
+    output_meta["timing_refiner"] = "stable-ts-align_words"
+    output_meta["timing_refinement_version"] = TIMING_REFINEMENT_VERSION
+    output_meta["timing_alignment_audio"] = "mixed_track_mono_16k"
+    output_meta["transcription_model"] = output_meta.get("transcription_model", cached_meta.get("model", "large-v3-faster-raw"))
+    if info is not None:
+        output_meta["language"] = info.language
+        output_meta["probability"] = round(info.language_probability, 2)
+    else:
+        output_meta.setdefault("language", "ja")
+
     final_output = {
-        "meta": {
-            "processing_time": round(total_time, 2),
-            "language": info.language,
-            "probability": round(info.language_probability, 2),
-            "model": "large-v3-faster-raw"
-        },
+        "meta": output_meta,
         "subtitles": results
     }
 

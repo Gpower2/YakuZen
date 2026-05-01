@@ -15,6 +15,7 @@ dependencies = [
   "faster-whisper",
   "onnxruntime-gpu",
   "requests",
+  "stable-ts[fw]",
   "torch",
   "tqdm",
   "unidic-lite",
