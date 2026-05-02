@@ -6,6 +6,7 @@ import requests
 import time
 import textwrap
 import re
+import argparse
 from functools import lru_cache
 from datetime import timedelta
 from tqdm import tqdm
@@ -20,6 +21,8 @@ from tqdm import tqdm
 # Reasoning: Assumes Ollama is running locally on the standard port.
 OLLAMA_URL = "http://localhost:11434/api/generate"
 
+DEFAULT_TRANSLATION_MODEL = "qwen3:14b"
+
 # MODEL_NAME
 # Default: "llama3" (varies by user)
 # Description: The LLM model to use for translation.
@@ -29,7 +32,7 @@ OLLAMA_URL = "http://localhost:11434/api/generate"
 #MODEL_NAME = "sakura-anime"
 #MODEL_NAME = "qwen2.5:14b"
 #MODEL_NAME = "qwen2.5:32b"
-MODEL_NAME = "qwen3:14b"
+MODEL_NAME = DEFAULT_TRANSLATION_MODEL
 #MODEL_NAME = "translategemma:12b"
 #MODEL_NAME = "qwen3:32b"
 
@@ -866,7 +869,12 @@ def sync_translated_cache(source_data, translated_data):
     synced_data["subtitles"] = synced_subs
     return synced_data, timings_changed
 
-def main(input_json_file):
+def main(input_json_file, translation_model=None):
+    global MODEL_NAME
+
+    if translation_model:
+        MODEL_NAME = translation_model
+
     if not os.path.exists(input_json_file):
         print(f"Error: File {input_json_file} not found.")
         return
@@ -985,8 +993,16 @@ def main(input_json_file):
         f.write(en_content)
     print(f"- {en_filename} (Merged + Timed 2-Line Split)")
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Translate Japanese subtitle JSON into English subtitle files.")
+    parser.add_argument("json_file", help="Path to the source subtitle JSON file.")
+    parser.add_argument(
+        "--translation-model",
+        default=DEFAULT_TRANSLATION_MODEL,
+        help="Ollama model name to use for translation.",
+    )
+    return parser.parse_args()
+
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage: python translate_subs.py <json_file>")
-    else:
-        main(sys.argv[1])
+    args = parse_args()
+    main(args.json_file, translation_model=args.translation_model)

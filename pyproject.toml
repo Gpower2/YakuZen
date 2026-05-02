@@ -9,6 +9,7 @@ description = "Desktop anime subtitling pipeline using local speech-to-text and 
 readme = "README.md"
 requires-python = ">=3.10,<3.13"
 dependencies = [
+  "accelerate",
   "audio-separator",
   "customtkinter",
   "faster-whisper",
@@ -16,9 +17,12 @@ dependencies = [
   "onnxruntime; platform_system == 'Darwin'",
   "pykakasi",
   "requests",
+  "safetensors",
+  "sentencepiece",
   "stable-ts[fw]",
   "torch",
   "torchaudio",
+  "transformers",
   "tqdm",
 ]
 
@@ -28,5 +32,6 @@ packages = []
 # Non-Python runtime dependencies still required outside this file:
 # - ffmpeg available on PATH
 # - Ollama running locally at http://localhost:11434
-# - A downloaded Ollama model that matches src\translate_subs.py (currently qwen3:14b)
+# - A downloaded Ollama model that matches src\translate_subs.py (currently qwen3:14b by default)
 # - A CUDA-capable NVIDIA environment for the current Whisper/ONNX settings
+# - Optional advanced ASR path: Kotoba-Whisper v1.1 is pulled automatically through Transformers when selected

@@ -14,9 +14,10 @@ YakuZen is a desktop subtitle-generation app for Japanese anime video files. It 
 1. `src\app.py` is the GUI and orchestrator. It scans the chosen folder, queues selected videos, and runs the worker scripts in background subprocesses. It parses `tqdm` output from those subprocesses to drive the GUI progress bars.
 2. `src\process_audio.py` handles the audio and transcription stage:
    - Reuses an existing `<base>.json` cache if present
-   - Separates the vocal stem with `audio_separator`
-   - Normalizes the stem with FFmpeg loudness normalization and resamples it to 16 kHz
-   - Transcribes Japanese speech with `faster-whisper` `large-v3` on CUDA
+   - Separates the vocal stem with `audio_separator`; the separator checkpoint is configurable for advanced users
+   - Extracts a mono 16 kHz copy of the original episode mix and now uses that **mixed track** as the default ASR source
+   - Keeps the raw separated vocal stem available as an advanced alternative, while the old loudness-normalized stem remains available as a legacy option
+   - Transcribes Japanese speech with `faster-whisper` `large-v3` by default on CUDA, with `kotoba-whisper-v1.1` exposed as an advanced alternative and a `hybrid` Whisper+Kotoba rescue mode exposed as an experimental option
    - Runs a second-pass timing refinement with `stable-ts align_words()` against a cached mono 16 kHz extract of the original episode mix
    - Runs an extra rescue pass for suspiciously long sparse cues with torchaudio MMS forced alignment plus `pykakasi` romanization to recover late-starting dialogue that stable-ts still anchors too early
    - Converts the Japanese transcript to phonetic romaji with `pykakasi`, including cache-only romaji refreshes for older outputs
@@ -24,7 +25,7 @@ YakuZen is a desktop subtitle-generation app for Japanese anime video files. It 
 3. `src\translate_subs.py` handles translation and final export:
    - Reuses `<base>_translated.json` if present
    - Infers the anime series title from the input filename and feeds it to the translator so character, organization, and place names have immediate context
-   - Uses Ollama at `http://localhost:11434/api/generate`; the default model is `qwen3:14b`, while `translategemma:12b` remains available as an optional translation-specialist alternative
+   - Uses Ollama at `http://localhost:11434/api/generate`; the default model is `qwen3:14b`, and the translation model is now configurable from both the CLI and desktop app
    - Uses context-aware batch prompting for general chat models, but switches to direct subtitle-style prompts for translation-specialist models like TranslateGemma
    - Repairs fragmentary multi-cue translations by retranslating the combined Japanese window once, splitting that natural English sentence back across the original cues, and storing a merged viewer-facing line for export
    - Post-processes the final `.en.srt` so oversized display cues are split back into timed subtitle chunks of at most two lines, preferring punctuation boundaries such as `!`, `?`, and sentence breaks when possible
@@ -40,14 +41,18 @@ Python dependencies are declared in `pyproject.toml`.
 ### Python packages
 
 - `audio-separator`
+- `accelerate`
 - `customtkinter`
 - `faster-whisper`
 - `onnxruntime-gpu` on Windows/Linux, `onnxruntime` on macOS
 - `pykakasi`
 - `requests`
+- `safetensors`
+- `sentencepiece`
 - `stable-ts[fw]`
 - `torch`
 - `torchaudio`
+- `transformers`
 - `tqdm`
 
 ### External tools and services
@@ -68,7 +73,7 @@ Python dependencies are declared in `pyproject.toml`.
 
 Across all operating systems, launch the GUI from the `src` directory because `app.py` starts sibling scripts by bare filename.
 
-Existing subtitle JSON caches without the current timing-refinement version are treated as upgradeable transcripts: the app can reuse the cached text and rerun only the timing-refinement stage. Translated caches are stricter: if the inferred series title, default translation model, or translation prompt version changes, `translate_subs.py` will regenerate the English cache instead of silently reusing stale wording.
+Existing subtitle JSON caches without the current timing-refinement version are treated as upgradeable transcripts: the app can reuse the cached text and rerun only the timing-refinement stage. Full transcript caches are also keyed by the selected transcription source, ASR model, and relevant separator checkpoint, so changing those options intentionally regenerates the Japanese transcript. Translated caches are stricter: if the inferred series title, translation model, or translation prompt version changes, `translate_subs.py` will regenerate the English cache instead of silently reusing stale wording.
 
 ## Installing dependencies
 
@@ -169,6 +174,52 @@ cd src
 python app.py
 ```
 
+When you launch the desktop app, the **Advanced Settings** panel lets you override:
+
+- **Transcription source**: `mix` (default), `raw_vocals`, or `normalized_vocals`
+- **ASR model**: `large-v3` (default) or `kotoba-whisper-v1.1`
+- **Experimental ASR model**: `hybrid`, which runs Whisper first and then lets Kotoba retry suspicious windows
+- **Separator model**: defaults to `model_bs_roformer_ep_317_sdr_12.9755.ckpt`
+- **Translation model**: defaults to `qwen3:14b`
+
+The shipped defaults are intentionally conservative:
+
+- **ASR source**: `mix`
+- **ASR model**: `large-v3`
+- **Separator model**: `model_bs_roformer_ep_317_sdr_12.9755.ckpt`
+- **Translation model**: `qwen3:14b`
+
+That combination gave the best balance of subtitle coverage, timing stability, and low-friction behavior in the bundled sample tests. `kotoba-whisper-v1.1` remains available as an advanced option when you want to experiment with better Japanese wording/proper-noun recovery, but it currently merges cues more aggressively and is therefore not the default.
+
+The new **`hybrid`** mode is available for experimentation when you want Whisper to keep the baseline segmentation while Kotoba tries to improve selected suspicious windows. It is intentionally **not** the default yet: on the bundled sample it improved some proper-noun phrasing, but it can still produce longer merged Japanese cues or partial noisy phrases in rescue windows.
+
+### How hybrid suspicious-window collection works
+
+The hybrid mode does **not** run Kotoba on the entire episode. Instead it:
+
+1. runs the normal `mix + large-v3` baseline first,
+2. refines that baseline with the existing timing pass,
+3. scans the refined Japanese transcript for windows that look worth retrying,
+4. reruns Kotoba only on those windows,
+5. and keeps Kotoba only when the replacement passes the merge heuristics.
+
+The suspicious-window detector currently uses two kinds of triggers:
+
+- **Suspicious blocks**: subtitle regions expanded around a seed cue that looks unreliable, such as:
+  - obvious ASCII-heavy output inside Japanese text,
+  - repeated-noise style text,
+  - or the existing long sparse cue heuristic used elsewhere in the pipeline.
+- **Long gap windows**: unusually large subtitle gaps that are long enough to suggest a dropped line rather than a natural conversational pause.
+
+Once a window is selected, Kotoba is transcribed only for that slice of audio. The candidate is then filtered before it can replace Whisper:
+
+- it must contain enough Japanese text to look real,
+- it must beat the baseline on a simple quality score,
+- it cannot collapse too aggressively into an obviously giant segment,
+- and close duplicate/subsequence fragments are pruned back out after merging.
+
+In practice, this means the hybrid mode is trying to recover **proper nouns** and **missed windows** without giving Kotoba permission to rewrite the whole episode. It is useful for A/B testing and edge-case recovery, but it still needs more refinement before it is safe as the default.
+
 ## Running the worker scripts directly
 
 ### Windows
@@ -176,8 +227,10 @@ python app.py
 ```powershell
 .\.venv\Scripts\Activate.ps1
 Set-Location src
-python process_audio.py ..\sample\Blue.Noah.1979.S01E01.AMZN.WEBRip.BK.mkv
-python translate_subs.py ..\sample\Blue.Noah.1979.S01E01.AMZN.WEBRip.BK.json
+python process_audio.py ..\sample\Blue.Noah.1979.S01E01.AMZN.WEBRip.BK.mkv --asr-source mix --asr-model large-v3
+python process_audio.py ..\sample\Blue.Noah.1979.S01E01.AMZN.WEBRip.BK.mkv --asr-source mix --asr-model hybrid
+python process_audio.py ..\sample\Blue.Noah.1979.S01E01.AMZN.WEBRip.BK.mkv --asr-source mix --asr-model kotoba-whisper-v1.1
+python translate_subs.py ..\sample\Blue.Noah.1979.S01E01.AMZN.WEBRip.BK.json --translation-model qwen3:14b
 python check_gpu.py
 ```
 
@@ -186,7 +239,9 @@ python check_gpu.py
 ```bash
 source .venv/bin/activate
 cd src
-python process_audio.py ../sample/Blue.Noah.1979.S01E01.AMZN.WEBRip.BK.mkv
-python translate_subs.py ../sample/Blue.Noah.1979.S01E01.AMZN.WEBRip.BK.json
+python process_audio.py ../sample/Blue.Noah.1979.S01E01.AMZN.WEBRip.BK.mkv --asr-source mix --asr-model large-v3
+python process_audio.py ../sample/Blue.Noah.1979.S01E01.AMZN.WEBRip.BK.mkv --asr-source mix --asr-model hybrid
+python process_audio.py ../sample/Blue.Noah.1979.S01E01.AMZN.WEBRip.BK.mkv --asr-source mix --asr-model kotoba-whisper-v1.1
+python translate_subs.py ../sample/Blue.Noah.1979.S01E01.AMZN.WEBRip.BK.json --translation-model qwen3:14b
 python check_gpu.py
 ```

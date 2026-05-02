@@ -10,12 +10,25 @@ from tkinter import filedialog, messagebox
 ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("blue")
 
+ASR_SOURCE_OPTIONS = {
+    "Original mix (Recommended)": "mix",
+    "Raw vocals stem": "raw_vocals",
+    "Normalized vocals stem (Legacy)": "normalized_vocals",
+}
+ASR_MODEL_OPTIONS = {
+    "Whisper large-v3 (Default)": "large-v3",
+    "Hybrid (Experimental: Whisper + Kotoba)": "hybrid",
+    "Kotoba-Whisper v1.1 (Advanced)": "kotoba-whisper-v1.1",
+}
+DEFAULT_SEPARATOR_MODEL = "model_bs_roformer_ep_317_sdr_12.9755.ckpt"
+DEFAULT_TRANSLATION_MODEL = "qwen3:14b"
+
 class AnimePipelineApp(ctk.CTk):
     def __init__(self):
         super().__init__()
 
         self.title("Anime AI Subtitler")
-        self.geometry("900x750")
+        self.geometry("960x840")
         
         # State variables
         self.selected_folder = ""
@@ -81,6 +94,54 @@ class AnimePipelineApp(ctk.CTk):
 
         self.cancel_all_btn = ctk.CTkButton(self.btn_frame, text="Cancel All", command=self.cancel_all, state="disabled", fg_color="red", hover_color="darkred")
         self.cancel_all_btn.grid(row=0, column=2, padx=5)
+
+        # Advanced settings
+        self.advanced_frame = ctk.CTkFrame(self.progress_frame)
+        self.advanced_frame.pack(pady=(0, 20), padx=20, fill="x")
+        self.advanced_frame.grid_columnconfigure(1, weight=1)
+
+        self.advanced_lbl = ctk.CTkLabel(self.advanced_frame, text="Advanced Settings", font=("Arial", 14, "bold"))
+        self.advanced_lbl.grid(row=0, column=0, columnspan=2, sticky="w", padx=10, pady=(10, 6))
+
+        self.asr_source_var = ctk.StringVar(value="Original mix (Recommended)")
+        self.asr_model_var = ctk.StringVar(value="Whisper large-v3 (Default)")
+        self.separator_model_var = ctk.StringVar(value=DEFAULT_SEPARATOR_MODEL)
+        self.translation_model_var = ctk.StringVar(value=DEFAULT_TRANSLATION_MODEL)
+
+        ctk.CTkLabel(self.advanced_frame, text="Transcription source").grid(row=1, column=0, sticky="w", padx=10, pady=4)
+        self.asr_source_menu = ctk.CTkComboBox(
+            self.advanced_frame,
+            values=list(ASR_SOURCE_OPTIONS.keys()),
+            variable=self.asr_source_var,
+            state="readonly",
+        )
+        self.asr_source_menu.grid(row=1, column=1, sticky="ew", padx=10, pady=4)
+
+        ctk.CTkLabel(self.advanced_frame, text="ASR model").grid(row=2, column=0, sticky="w", padx=10, pady=4)
+        self.asr_model_menu = ctk.CTkComboBox(
+            self.advanced_frame,
+            values=list(ASR_MODEL_OPTIONS.keys()),
+            variable=self.asr_model_var,
+            state="readonly",
+        )
+        self.asr_model_menu.grid(row=2, column=1, sticky="ew", padx=10, pady=4)
+
+        ctk.CTkLabel(self.advanced_frame, text="Separator model").grid(row=3, column=0, sticky="w", padx=10, pady=4)
+        self.separator_model_entry = ctk.CTkEntry(self.advanced_frame, textvariable=self.separator_model_var)
+        self.separator_model_entry.grid(row=3, column=1, sticky="ew", padx=10, pady=4)
+
+        ctk.CTkLabel(self.advanced_frame, text="Translation model").grid(row=4, column=0, sticky="w", padx=10, pady=4)
+        self.translation_model_entry = ctk.CTkEntry(self.advanced_frame, textvariable=self.translation_model_var)
+        self.translation_model_entry.grid(row=4, column=1, sticky="ew", padx=10, pady=4)
+
+        self.advanced_note = ctk.CTkLabel(
+            self.advanced_frame,
+            text="Casual users can leave these defaults alone. Advanced users can switch the ASR source/model or override the separator and Ollama translation models. Hybrid runs Whisper first and then applies a targeted Kotoba rescue pass on suspicious windows; it is useful for A/B testing but remains experimental.",
+            justify="left",
+            wraplength=360,
+            text_color="gray70",
+        )
+        self.advanced_note.grid(row=5, column=0, columnspan=2, sticky="w", padx=10, pady=(4, 10))
 
         # --- BOTTOM: Console ---
         self.console = ctk.CTkTextbox(self, height=150, font=("Consolas", 12))
@@ -169,17 +230,36 @@ class AnimePipelineApp(ctk.CTk):
             self.log_to_console("[!!!] User cancelled the entire queue.")
 
     def start_pipeline(self):
-        selected_files = [var.get() for cb, var in self.checkboxes if var.get() != ""]
+        selected_files = [var.get() for _cb, var in self.checkboxes if var.get() != ""]
         if not selected_files:
             messagebox.showwarning("Warning", "Please select at least one file to process.")
             return
+
+        pipeline_settings = self.get_pipeline_settings()
 
         self.is_running = True
         self.cancel_all_flag = False
         self.set_buttons_state(running=True)
         self.log_to_console("=== PIPELINE STARTED ===")
+        self.log_to_console(
+            "Settings: "
+            f"source={pipeline_settings['asr_source']}, "
+            f"asr={pipeline_settings['asr_model']}, "
+            f"separator={pipeline_settings['separator_model']}, "
+            f"translation={pipeline_settings['translation_model']}"
+        )
         
-        threading.Thread(target=self.run_queue, args=(selected_files,), daemon=True).start()
+        threading.Thread(target=self.run_queue, args=(selected_files, pipeline_settings), daemon=True).start()
+
+    def get_pipeline_settings(self):
+        separator_model = self.separator_model_var.get().strip() or DEFAULT_SEPARATOR_MODEL
+        translation_model = self.translation_model_var.get().strip() or DEFAULT_TRANSLATION_MODEL
+        return {
+            "asr_source": ASR_SOURCE_OPTIONS[self.asr_source_var.get()],
+            "asr_model": ASR_MODEL_OPTIONS[self.asr_model_var.get()],
+            "separator_model": separator_model,
+            "translation_model": translation_model,
+        }
 
     # --- PROCESS EXECUTION ---
     def read_output_stream(self, process):
@@ -211,7 +291,7 @@ class AnimePipelineApp(ctk.CTk):
             else:
                 buffer += char
 
-    def run_script(self, script_name, target_file, status_msg):
+    def run_script(self, script_name, target_file, status_msg, extra_args=None):
         self.cancel_current_flag = False
         self.update_task_progress(0, status_text=status_msg)
         self.log_to_console(f">> Running {script_name}...")
@@ -219,8 +299,11 @@ class AnimePipelineApp(ctk.CTk):
         try:
             # TWEAK: Removed text=True and universal_newlines. 
             # bufsize=0 forces true unbuffered binary streaming.
+            command = [sys.executable, "-u", script_name, target_file]
+            if extra_args:
+                command.extend(extra_args)
             self.current_process = subprocess.Popen(
-                [sys.executable, "-u", script_name, target_file],
+                command,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 bufsize=0 
@@ -248,7 +331,7 @@ class AnimePipelineApp(ctk.CTk):
             self.log_to_console(f"[EXCEPTION] {str(e)}")
             return False
 
-    def run_queue(self, files_to_process):
+    def run_queue(self, files_to_process, pipeline_settings):
         total_files = len(files_to_process)
         self.update_total_progress(0, total_files)
 
@@ -263,7 +346,17 @@ class AnimePipelineApp(ctk.CTk):
             self.log_to_console(f"\n--- Processing [{idx}/{total_files}]: {file_name} ---")
 
             # 1. Process Audio
-            success = self.run_script("process_audio.py", full_path, f"Isolating & Transcribing: {file_name}")
+            process_audio_args = [
+                "--asr-source", pipeline_settings["asr_source"],
+                "--asr-model", pipeline_settings["asr_model"],
+                "--separator-model", pipeline_settings["separator_model"],
+            ]
+            success = self.run_script(
+                "process_audio.py",
+                full_path,
+                f"Isolating & Transcribing: {file_name}",
+                extra_args=process_audio_args,
+            )
             
             if self.cancel_all_flag: break
             if not success and not self.cancel_current_flag:
@@ -273,7 +366,15 @@ class AnimePipelineApp(ctk.CTk):
             
             # 2. Translate Subtitles (only if not skipping current)
             if not self.cancel_current_flag:
-                self.run_script("translate_subs.py", json_path, f"Translating & Formatting: {file_name}")
+                translate_args = [
+                    "--translation-model", pipeline_settings["translation_model"],
+                ]
+                self.run_script(
+                    "translate_subs.py",
+                    json_path,
+                    f"Translating & Formatting: {file_name}",
+                    extra_args=translate_args,
+                )
 
             self.update_total_progress(idx, total_files)
 
