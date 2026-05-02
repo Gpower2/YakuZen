@@ -3,6 +3,8 @@ import sys
 import threading
 import subprocess
 import re
+import codecs
+import json
 import customtkinter as ctk
 from tkinter import filedialog, messagebox
 
@@ -22,13 +24,33 @@ ASR_MODEL_OPTIONS = {
 }
 DEFAULT_SEPARATOR_MODEL = "model_bs_roformer_ep_317_sdr_12.9755.ckpt"
 DEFAULT_TRANSLATION_MODEL = "qwen3:14b"
+SEPARATOR_MODEL_OPTIONS = {
+    "BS-RoFormer (Default)": DEFAULT_SEPARATOR_MODEL,
+}
+TRANSLATION_MODEL_OPTIONS = {
+    "Qwen3 14B (Default)": "qwen3:14b",
+    "TranslateGemma 12B": "translategemma:12b",
+}
+SCRIPT_STATUS_LABELS = {
+    "process_audio.py": {
+        "extracting_alignment_audio": "Extracting alignment audio",
+        "normalizing_audio": "Normalizing vocals audio",
+        "separating_vocals": "Separating vocals stem",
+        "skipping_separation": "Reusing cached vocals stem",
+        "transcribing": "Transcribing Japanese audio",
+        "refining_timestamps": "Refining subtitle timings",
+        "saving_debug": "Saving raw transcript debug output",
+        "saved_to_disk": "Writing subtitle files to disk",
+        "done": "Japanese transcription stage finished",
+    }
+}
 
 class AnimePipelineApp(ctk.CTk):
     def __init__(self):
         super().__init__()
 
         self.title("Anime AI Subtitler")
-        self.geometry("960x840")
+        self.geometry("1040x900")
         
         # State variables
         self.selected_folder = ""
@@ -57,8 +79,40 @@ class AnimePipelineApp(ctk.CTk):
         self.middle_frame.pack(pady=5, padx=10, fill="both", expand=True)
 
         # Left: File Selection
-        self.file_frame = ctk.CTkScrollableFrame(self.middle_frame, label_text="Select Video Files")
-        self.file_frame.pack(side="left", fill="both", expand=True, padx=(0, 5))
+        self.file_panel = ctk.CTkFrame(self.middle_frame)
+        self.file_panel.pack(side="left", fill="both", expand=True, padx=(0, 5))
+
+        self.file_header = ctk.CTkFrame(self.file_panel, fg_color="transparent")
+        self.file_header.pack(fill="x", padx=10, pady=(10, 5))
+
+        self.selected_count_lbl = ctk.CTkLabel(
+            self.file_header,
+            text="Selected Files: 0 / 0",
+            font=("Arial", 14, "bold"),
+        )
+        self.selected_count_lbl.pack(side="left")
+
+        self.file_shortcuts = ctk.CTkFrame(self.file_header, fg_color="transparent")
+        self.file_shortcuts.pack(side="right")
+
+        self.select_all_btn = ctk.CTkButton(
+            self.file_shortcuts,
+            text="Select All",
+            width=110,
+            command=self.select_all_files,
+        )
+        self.select_all_btn.pack(side="left", padx=(0, 5))
+
+        self.deselect_all_btn = ctk.CTkButton(
+            self.file_shortcuts,
+            text="Deselect All",
+            width=110,
+            command=self.deselect_all_files,
+        )
+        self.deselect_all_btn.pack(side="left")
+
+        self.file_frame = ctk.CTkScrollableFrame(self.file_panel, label_text="Select Video Files")
+        self.file_frame.pack(fill="both", expand=True, padx=10, pady=(0, 10))
 
         # Right: Progress & Controls
         self.progress_frame = ctk.CTkFrame(self.middle_frame)
@@ -105,8 +159,10 @@ class AnimePipelineApp(ctk.CTk):
 
         self.asr_source_var = ctk.StringVar(value="Original mix (Recommended)")
         self.asr_model_var = ctk.StringVar(value="Whisper large-v3 (Default)")
-        self.separator_model_var = ctk.StringVar(value=DEFAULT_SEPARATOR_MODEL)
-        self.translation_model_var = ctk.StringVar(value=DEFAULT_TRANSLATION_MODEL)
+        self.separator_model_var = ctk.StringVar(value="BS-RoFormer (Default)")
+        self.separator_model_custom_var = ctk.StringVar(value="")
+        self.translation_model_var = ctk.StringVar(value="Qwen3 14B (Default)")
+        self.translation_model_custom_var = ctk.StringVar(value="")
 
         ctk.CTkLabel(self.advanced_frame, text="Transcription source").grid(row=1, column=0, sticky="w", padx=10, pady=4)
         self.asr_source_menu = ctk.CTkComboBox(
@@ -126,25 +182,51 @@ class AnimePipelineApp(ctk.CTk):
         )
         self.asr_model_menu.grid(row=2, column=1, sticky="ew", padx=10, pady=4)
 
-        ctk.CTkLabel(self.advanced_frame, text="Separator model").grid(row=3, column=0, sticky="w", padx=10, pady=4)
-        self.separator_model_entry = ctk.CTkEntry(self.advanced_frame, textvariable=self.separator_model_var)
-        self.separator_model_entry.grid(row=3, column=1, sticky="ew", padx=10, pady=4)
+        ctk.CTkLabel(self.advanced_frame, text="Separator model preset").grid(row=3, column=0, sticky="w", padx=10, pady=4)
+        self.separator_model_menu = ctk.CTkComboBox(
+            self.advanced_frame,
+            values=list(SEPARATOR_MODEL_OPTIONS.keys()),
+            variable=self.separator_model_var,
+            state="readonly",
+        )
+        self.separator_model_menu.grid(row=3, column=1, sticky="ew", padx=10, pady=4)
 
-        ctk.CTkLabel(self.advanced_frame, text="Translation model").grid(row=4, column=0, sticky="w", padx=10, pady=4)
-        self.translation_model_entry = ctk.CTkEntry(self.advanced_frame, textvariable=self.translation_model_var)
-        self.translation_model_entry.grid(row=4, column=1, sticky="ew", padx=10, pady=4)
+        ctk.CTkLabel(self.advanced_frame, text="Custom separator model (Optional)").grid(row=4, column=0, sticky="w", padx=10, pady=4)
+        self.separator_model_entry = ctk.CTkEntry(
+            self.advanced_frame,
+            textvariable=self.separator_model_custom_var,
+            placeholder_text="Override with another separator checkpoint filename",
+        )
+        self.separator_model_entry.grid(row=4, column=1, sticky="ew", padx=10, pady=4)
+
+        ctk.CTkLabel(self.advanced_frame, text="Translation model preset").grid(row=5, column=0, sticky="w", padx=10, pady=4)
+        self.translation_model_menu = ctk.CTkComboBox(
+            self.advanced_frame,
+            values=list(TRANSLATION_MODEL_OPTIONS.keys()),
+            variable=self.translation_model_var,
+            state="readonly",
+        )
+        self.translation_model_menu.grid(row=5, column=1, sticky="ew", padx=10, pady=4)
+
+        ctk.CTkLabel(self.advanced_frame, text="Custom translation model (Optional)").grid(row=6, column=0, sticky="w", padx=10, pady=4)
+        self.translation_model_entry = ctk.CTkEntry(
+            self.advanced_frame,
+            textvariable=self.translation_model_custom_var,
+            placeholder_text="Override with another local Ollama model name",
+        )
+        self.translation_model_entry.grid(row=6, column=1, sticky="ew", padx=10, pady=4)
 
         self.advanced_note = ctk.CTkLabel(
             self.advanced_frame,
-            text="Casual users can leave these defaults alone. Advanced users can switch the ASR source/model or override the separator and Ollama translation models. Hybrid runs Whisper first and then applies a targeted Kotoba rescue pass on suspicious windows; it is useful for A/B testing but remains experimental.",
+            text="Casual users can leave these defaults alone. Advanced users can switch the ASR source/model, keep the default BS-RoFormer separator preset or override it with another checkpoint filename, and choose a translation-model preset with an optional custom Ollama override. Hybrid runs Whisper first and then applies a targeted Kotoba rescue pass on suspicious windows; it is useful for A/B testing but remains experimental.",
             justify="left",
             wraplength=360,
             text_color="gray70",
         )
-        self.advanced_note.grid(row=5, column=0, columnspan=2, sticky="w", padx=10, pady=(4, 10))
+        self.advanced_note.grid(row=7, column=0, columnspan=2, sticky="w", padx=10, pady=(4, 10))
 
         # --- BOTTOM: Console ---
-        self.console = ctk.CTkTextbox(self, height=150, font=("Consolas", 12))
+        self.console = ctk.CTkTextbox(self, height=220, font=("Consolas", 12))
         self.console.pack(pady=10, padx=10, fill="x")
         self.console.configure(state="disabled")
 
@@ -157,7 +239,14 @@ class AnimePipelineApp(ctk.CTk):
             self.console.configure(state="disabled")
         self.after(0, update)
 
+    def update_selected_count(self):
+        selected = len(self.get_selected_files())
+        total = len(self.checkboxes)
+        self.selected_count_lbl.configure(text=f"Selected Files: {selected} / {total}")
+
     def update_task_progress(self, percent, status_text=None):
+        percent = max(0, min(100, int(percent)))
+
         def update():
             self.task_progress.set(percent / 100.0)
             self.task_lbl.configure(text=f"Current Task Progress: {int(percent)}%")
@@ -192,11 +281,25 @@ class AnimePipelineApp(ctk.CTk):
             self.folder_label.configure(text=folder)
             self.scan_for_videos()
 
+    def get_selected_files(self):
+        return [var.get() for _cb, var in self.checkboxes if var.get()]
+
+    def select_all_files(self):
+        for checkbox, var in self.checkboxes:
+            var.set(checkbox.cget("text"))
+        self.update_selected_count()
+
+    def deselect_all_files(self):
+        for _checkbox, var in self.checkboxes:
+            var.set("")
+        self.update_selected_count()
+
     def scan_for_videos(self):
         for cb, var in self.checkboxes:
             cb.destroy()
         self.checkboxes.clear()
         self.video_files.clear()
+        self.update_selected_count()
 
         valid_exts = (".mkv", ".mp4", ".avi", ".mov")
         for f in os.listdir(self.selected_folder):
@@ -205,13 +308,23 @@ class AnimePipelineApp(ctk.CTk):
 
         if not self.video_files:
             messagebox.showinfo("Notice", "No video files found in this folder.")
+            self.update_selected_count()
             return
 
         for file_name in self.video_files:
             var = ctk.StringVar(value=file_name) # Default checked
-            cb = ctk.CTkCheckBox(self.file_frame, text=file_name, variable=var, onvalue=file_name, offvalue="")
+            cb = ctk.CTkCheckBox(
+                self.file_frame,
+                text=file_name,
+                variable=var,
+                onvalue=file_name,
+                offvalue="",
+                command=self.update_selected_count,
+            )
             cb.pack(anchor="w", pady=5, padx=5)
             self.checkboxes.append((cb, var))
+
+        self.update_selected_count()
 
     def cancel_current(self):
         if self.is_running and self.current_process:
@@ -230,7 +343,7 @@ class AnimePipelineApp(ctk.CTk):
             self.log_to_console("[!!!] User cancelled the entire queue.")
 
     def start_pipeline(self):
-        selected_files = [var.get() for _cb, var in self.checkboxes if var.get() != ""]
+        selected_files = self.get_selected_files()
         if not selected_files:
             messagebox.showwarning("Warning", "Please select at least one file to process.")
             return
@@ -252,8 +365,8 @@ class AnimePipelineApp(ctk.CTk):
         threading.Thread(target=self.run_queue, args=(selected_files, pipeline_settings), daemon=True).start()
 
     def get_pipeline_settings(self):
-        separator_model = self.separator_model_var.get().strip() or DEFAULT_SEPARATOR_MODEL
-        translation_model = self.translation_model_var.get().strip() or DEFAULT_TRANSLATION_MODEL
+        separator_model = self.separator_model_custom_var.get().strip() or SEPARATOR_MODEL_OPTIONS[self.separator_model_var.get()]
+        translation_model = self.translation_model_custom_var.get().strip() or TRANSLATION_MODEL_OPTIONS[self.translation_model_var.get()]
         return {
             "asr_source": ASR_SOURCE_OPTIONS[self.asr_source_var.get()],
             "asr_model": ASR_MODEL_OPTIONS[self.asr_model_var.get()],
@@ -262,38 +375,116 @@ class AnimePipelineApp(ctk.CTk):
         }
 
     # --- PROCESS EXECUTION ---
-    def read_output_stream(self, process):
-        """Reads raw binary stdout byte-by-byte to perfectly catch tqdm carriage returns."""
+    def get_script_label(self, script_name):
+        return os.path.splitext(os.path.basename(script_name))[0]
+
+    def describe_script_status(self, script_name, payload):
+        if "error" in payload:
+            return f"Error: {payload['error']}"
+
+        status = payload.get("status")
+        if not status:
+            return None
+
+        message = SCRIPT_STATUS_LABELS.get(script_name, {}).get(status, status.replace("_", " ").title())
+        file_hint = payload.get("file") or payload.get("cached_file")
+        if file_hint and status in {"saving_debug", "saved_to_disk", "skipping_separation"}:
+            message = f"{message}: {os.path.basename(file_hint)}"
+        return message
+
+    def extract_progress_status(self, line):
+        match = re.match(r"^(.*):\s+\d+%", line)
+        if match:
+            return match.group(1).strip()
+        return None
+
+    def handle_output_line(self, line, script_name, progress_state):
+        clean_line = line.strip()
+        if not clean_line:
+            return
+
+        script_label = self.get_script_label(script_name)
+
+        try:
+            payload = json.loads(clean_line)
+        except json.JSONDecodeError:
+            payload = None
+
+        if isinstance(payload, dict):
+            status_text = self.describe_script_status(script_name, payload)
+            if status_text:
+                if status_text != progress_state["last_status_text"]:
+                    self.log_to_console(f"[{script_label}] {status_text}")
+                    progress_state["last_status_text"] = status_text
+                if payload.get("status") == "done":
+                    progress_state["completed"] = True
+                    progress_state["last_percent"] = 100
+                    self.update_task_progress(100, status_text=status_text)
+                else:
+                    self.update_task_progress(progress_state["last_percent"], status_text=status_text)
+            return
+
+        percent_match = re.search(r"(\d+)%", clean_line)
+        if percent_match:
+            percent = int(percent_match.group(1))
+            if percent >= 100 and not progress_state["completed"]:
+                percent = 99
+            progress_state["last_percent"] = max(progress_state["last_percent"], percent)
+
+            status_text = self.extract_progress_status(clean_line)
+            if status_text:
+                progress_state["last_status_text"] = status_text
+                self.update_task_progress(progress_state["last_percent"], status_text=status_text)
+            else:
+                self.update_task_progress(progress_state["last_percent"])
+            return
+
+        self.log_to_console(f"[{script_label}] {clean_line}")
+        self.update_task_progress(progress_state["last_percent"], status_text=clean_line)
+        progress_state["last_status_text"] = clean_line
+
+    def read_output_stream(self, process, script_name, progress_state):
+        """Reads raw stdout byte-by-byte while preserving UTF-8 multibyte characters and tqdm carriage returns."""
         buffer = ""
+        decoder = codecs.getincrementaldecoder("utf-8")()
         while True:
-            # Read exactly 1 raw byte
             raw_byte = process.stdout.read(1)
             if not raw_byte:
                 break
-            
-            try:
-                char = raw_byte.decode('utf-8')
-            except UnicodeDecodeError:
-                continue # Skip weird binary artifacts
-            
+
+            decoded = decoder.decode(raw_byte)
+            if not decoded:
+                continue
+
+            for char in decoded:
+                if char == '\r' or char == '\n':
+                    if buffer:
+                        self.handle_output_line(buffer, script_name, progress_state)
+                    buffer = ""
+                else:
+                    buffer += char
+
+        tail = decoder.decode(b"", final=True)
+        for char in tail:
             if char == '\r' or char == '\n':
                 if buffer:
-                    # Look for tqdm percentage e.g., " 45%"
-                    match = re.search(r"(\d+)%", buffer)
-                    if match:
-                        self.update_task_progress(int(match.group(1)))
-                    else:
-                        # Log normal text output (ignore raw JSON dictionary spam)
-                        clean_line = buffer.strip()
-                        if clean_line and "{" not in clean_line:
-                            self.log_to_console(clean_line)
+                    self.handle_output_line(buffer, script_name, progress_state)
                 buffer = ""
             else:
                 buffer += char
 
+        if buffer:
+            self.handle_output_line(buffer, script_name, progress_state)
+
     def run_script(self, script_name, target_file, status_msg, extra_args=None):
         self.cancel_current_flag = False
         self.update_task_progress(0, status_text=status_msg)
+        script_label = self.get_script_label(script_name)
+        progress_state = {
+            "completed": False,
+            "last_percent": 0,
+            "last_status_text": status_msg,
+        }
         self.log_to_console(f">> Running {script_name}...")
 
         try:
@@ -310,11 +501,16 @@ class AnimePipelineApp(ctk.CTk):
             )
 
             # Thread to read the unified binary stream
-            reader_thread = threading.Thread(target=self.read_output_stream, args=(self.current_process,), daemon=True)
+            reader_thread = threading.Thread(
+                target=self.read_output_stream,
+                args=(self.current_process, script_name, progress_state),
+                daemon=True,
+            )
             reader_thread.start()
 
             # Wait for the AI process to finish (or get killed)
             self.current_process.wait()
+            reader_thread.join(timeout=1)
 
             if self.cancel_current_flag:
                 return False
@@ -324,7 +520,8 @@ class AnimePipelineApp(ctk.CTk):
                 self.log_to_console(f"[ERROR] {script_name} returned non-zero exit code: {self.current_process.returncode}")
                 return False
 
-            self.update_task_progress(100)
+            if not progress_state["completed"]:
+                self.update_task_progress(100, status_text=f"{script_label} finished")
             return True
 
         except Exception as e:

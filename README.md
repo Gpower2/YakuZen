@@ -5,7 +5,9 @@ YakuZen is a desktop subtitle-generation app for Japanese anime video files. It 
 ## What the app does
 
 - Lets you pick a folder of video files (`.mkv`, `.mp4`, `.avi`, `.mov`) in a CustomTkinter UI
+- Shows how many files are selected and includes quick **Select All** / **Deselect All** shortcuts
 - Queues selected files and shows per-file plus total progress
+- Streams worker-script status and output into the UI console while processing runs
 - Produces Japanese, romaji, and English subtitle artifacts
 - Supports skipping the current file or cancelling the entire queue
 
@@ -188,8 +190,10 @@ When you launch the desktop app, the **Advanced Settings** panel lets you overri
 - **Transcription source**: `mix` (default), `raw_vocals`, or `normalized_vocals`
 - **ASR model**: `large-v3` (default) or `kotoba-whisper-v1.1`
 - **Experimental ASR model**: `hybrid`, which runs Whisper first and then lets Kotoba retry suspicious windows
-- **Separator model**: defaults to `model_bs_roformer_ep_317_sdr_12.9755.ckpt`
-- **Translation model**: defaults to `qwen3:14b`
+- **Separator model preset**: currently ships with `BS-RoFormer (Default)`, which resolves to `model_bs_roformer_ep_317_sdr_12.9755.ckpt`
+- **Custom separator model override**: optional; if filled in, the app passes that checkpoint filename straight through to `process_audio.py`
+- **Translation model preset**: `qwen3:14b` (default) or `translategemma:12b`
+- **Custom translation model override**: optional; if filled in, the app passes that Ollama model name straight through to `translate_subs.py`
 
 The shipped defaults are intentionally conservative:
 
