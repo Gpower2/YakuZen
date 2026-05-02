@@ -1,0 +1,34 @@
+* text=auto eol=lf
+
+# Binary assets
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.ico binary
+*.pdf binary
+*.zip binary
+*.7z binary
+*.rar binary
+*.gz binary
+*.bz2 binary
+*.xz binary
+*.mp3 binary
+*.wav binary
+*.flac binary
+*.ogg binary
+*.mp4 binary
+*.mkv binary
+*.avi binary
+*.mov binary
+*.exe binary
+*.dll binary
+*.so binary
+*.dylib binary
+*.pyd binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.otf binary
+*.eot binary
