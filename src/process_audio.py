@@ -9,19 +9,29 @@ import contextlib
 import wave
 import warnings
 import re
+import numpy as np
 from datetime import timedelta
 from tqdm import tqdm
-import cutlet
 import stable_whisper
 import torch
+import torchaudio
 from audio_separator.separator import Separator
+from pykakasi import kakasi
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
 # --- CONFIGURATION ---
 TEMP_DIR = os.path.abspath("./temp")
 TIMING_REFINEMENT_VAD_THRESHOLD = 0.35
-TIMING_REFINEMENT_VERSION = 2
+TIMING_REFINEMENT_VERSION = 6
+ROMAJI_VERSION = 2
+SUSPICIOUS_SEGMENT_MIN_DURATION = 8.0
+SUSPICIOUS_SEGMENT_MAX_CHARS_PER_SECOND = 2.5
+RESCUE_ACCEPT_MIN_SHIFT = 0.75
+CTC_ALIGNMENT_SAMPLE_RATE = 16000
+HONORIFIC_ROMAJI_PREFIXES = {"お", "ご", "御"}
+
+_ctc_alignment_resources = None
 
 def get_audio_duration(file_path):
     try:
@@ -43,20 +53,20 @@ def format_timestamp(seconds):
 
 def normalize_audio(input_path, output_path, duration):
     print(json.dumps({"status": "normalizing_audio"}), file=sys.stderr)
-    
+
     # FFmpeg Loudness Normalization (loudnorm)
     # Default: N/A (FFmpeg passes audio as-is)
     # Description: Analyzes the audio and mathematically flattens the dynamic range.
-    # Reasoning: Anime dynamic range is extreme. This ensures quiet whispers and loud screams 
+    # Reasoning: Anime dynamic range is extreme. This ensures quiet whispers and loud screams
     # are fed to the AI at the exact same optimal volume level, preventing dropped words.
     command = [
         "ffmpeg", "-y", "-i", input_path,
         "-af", "loudnorm=I=-16:TP=-1.5:LRA=11",
         "-ar", "16000", output_path
     ]
-    
+
     process = subprocess.Popen(command, stderr=subprocess.PIPE, universal_newlines=True)
-    
+
     with tqdm(total=duration, unit='s', desc="Normalizing Audio", file=sys.stderr) as pbar:
         for line in process.stderr:
             time_match = re.search(r"time=(\d{2}):(\d{2}):(\d{2}\.\d+)", line)
@@ -65,7 +75,7 @@ def normalize_audio(input_path, output_path, duration):
                 current_time = (h * 3600) + (m * 60) + s
                 pbar.n = min(current_time, duration)
                 pbar.refresh()
-                
+
     process.wait()
 
 def extract_alignment_audio(input_path, output_path):
@@ -84,7 +94,7 @@ def save_srt(subtitles, output_path, text_key):
         end = format_timestamp(sub['end'])
         text = sub[text_key]
         srt_output.append(f"{idx}\n{start} --> {end}\n{text}\n")
-    
+
     with open(output_path, "w", encoding="utf-8") as f:
         f.write("\n".join(srt_output))
 
@@ -95,6 +105,168 @@ def get_whisper_runtime():
     if torch.cuda.is_available():
         return "cuda", "float16"
     return "cpu", "int8"
+
+def normalize_alignment_text(text):
+    text = text.lower().replace("’", "'")
+    text = re.sub(r"[^a-z']", "", text)
+    return text.strip()
+
+def romanize_text(text, romanizer):
+    converted = romanizer.convert(text)
+    parts = []
+    index = 0
+
+    while index < len(converted):
+        current = converted[index]
+        original = str(current.get("orig", "")).strip()
+        hepburn = str(current.get("hepburn", "")).strip()
+
+        if not hepburn:
+            index += 1
+            continue
+
+        if original in HONORIFIC_ROMAJI_PREFIXES and index + 1 < len(converted):
+            next_hepburn = str(converted[index + 1].get("hepburn", "")).strip()
+            if next_hepburn:
+                parts.append(f"{hepburn}{next_hepburn}")
+                index += 2
+                continue
+
+        parts.append(hepburn)
+        index += 1
+
+    romaji = re.sub(r"\s+", " ", " ".join(parts)).strip()
+    if not romaji:
+        return ""
+    return romaji[:1].upper() + romaji[1:]
+
+def rebuild_subtitles_romaji(subtitles, romanizer):
+    updated_subtitles = []
+    for subtitle in subtitles:
+        updated_subtitle = dict(subtitle)
+        updated_subtitle["text_romaji"] = romanize_text(subtitle.get("text_jp", ""), romanizer)
+        updated_subtitles.append(updated_subtitle)
+    return updated_subtitles
+
+def get_ctc_alignment_resources():
+    global _ctc_alignment_resources
+
+    if _ctc_alignment_resources is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        bundle = torchaudio.pipelines.MMS_FA
+        model = bundle.get_model(with_star=False).to(device)
+        model.eval()
+        _ctc_alignment_resources = {
+            "device": device,
+            "model": model,
+            "tokenizer": bundle.get_tokenizer(),
+            "aligner": bundle.get_aligner(),
+            "kakasi": kakasi(),
+        }
+
+    return _ctc_alignment_resources
+
+def read_wav_clip(audio_path, start_sec, end_sec):
+    with contextlib.closing(wave.open(audio_path, 'rb')) as wf:
+        sample_rate = wf.getframerate()
+        channels = wf.getnchannels()
+        sample_width = wf.getsampwidth()
+        total_frames = wf.getnframes()
+
+        if sample_width != 2:
+            raise ValueError(f"Unsupported WAV sample width: {sample_width}")
+
+        start_frame = max(0, min(total_frames, int(start_sec * sample_rate)))
+        end_frame = max(start_frame, min(total_frames, int(end_sec * sample_rate)))
+        wf.setpos(start_frame)
+        frames = wf.readframes(end_frame - start_frame)
+
+    audio = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
+    if channels > 1:
+        audio = audio.reshape(-1, channels).mean(axis=1)
+    return audio
+
+def is_suspicious_segment(subtitle):
+    duration = subtitle["end"] - subtitle["start"]
+    chars_per_second = len(subtitle["text_jp"]) / max(duration, 0.001)
+    return (
+        duration >= SUSPICIOUS_SEGMENT_MIN_DURATION
+        and chars_per_second <= SUSPICIOUS_SEGMENT_MAX_CHARS_PER_SECOND
+    )
+
+def build_subtitles_from_raw_segments(raw_segments, romanizer):
+    subtitles = []
+    for segment in raw_segments:
+        text_jp = segment["text"].replace(" ", "").strip()
+        if text_jp:
+            subtitles.append({
+                "start": round(segment["start"], 3),
+                "end": round(segment["end"], 3),
+                "text_jp": text_jp,
+                "text_romaji": romanize_text(text_jp, romanizer),
+            })
+    return subtitles
+
+def rescue_suspicious_timings(audio_path, source_subtitles, refined_subtitles, duration):
+    rescued_subtitles = []
+
+    for source_subtitle, refined_subtitle in zip(source_subtitles, refined_subtitles):
+        if not is_suspicious_segment(source_subtitle):
+            rescued_subtitles.append(refined_subtitle)
+            continue
+
+        clip_audio = read_wav_clip(audio_path, source_subtitle["start"], source_subtitle["end"])
+        if clip_audio.size == 0:
+            rescued_subtitles.append(refined_subtitle)
+            continue
+
+        resources = get_ctc_alignment_resources()
+        romanized_tokens = [
+            normalize_alignment_text(item["hepburn"])
+            for item in resources["kakasi"].convert(source_subtitle["text_jp"])
+        ]
+        romanized_tokens = [token for token in romanized_tokens if token]
+        if not romanized_tokens:
+            rescued_subtitles.append(refined_subtitle)
+            continue
+
+        waveform = torch.from_numpy(clip_audio).unsqueeze(0).to(resources["device"])
+        with torch.inference_mode():
+            emission, _ = resources["model"](waveform)
+
+        token_ids = resources["tokenizer"](romanized_tokens)
+        token_spans = resources["aligner"](emission[0].cpu(), token_ids)
+        token_spans = [spans for spans in token_spans if spans]
+        if not token_spans:
+            rescued_subtitles.append(refined_subtitle)
+            continue
+
+        ratio = waveform.size(1) / emission.size(1) / CTC_ALIGNMENT_SAMPLE_RATE
+        rescued_start = round(
+            clamp_timestamp(source_subtitle["start"] + token_spans[0][0].start * ratio, duration),
+            3,
+        )
+        rescued_end = round(
+            max(
+                rescued_start,
+                clamp_timestamp(source_subtitle["start"] + token_spans[-1][-1].end * ratio, duration),
+            ),
+            3,
+        )
+
+        start_shift = abs(rescued_start - refined_subtitle["start"])
+        end_shift = abs(rescued_end - refined_subtitle["end"])
+        if start_shift < RESCUE_ACCEPT_MIN_SHIFT and end_shift < RESCUE_ACCEPT_MIN_SHIFT:
+            rescued_subtitles.append(refined_subtitle)
+            continue
+
+        rescued_subtitles.append({
+            **refined_subtitle,
+            "start": rescued_start,
+            "end": rescued_end,
+        })
+
+    return rescued_subtitles
 
 def refine_subtitle_timings(model, audio_path, subtitles, duration):
     print(json.dumps({"status": "refining_timestamps"}), file=sys.stderr)
@@ -137,11 +309,11 @@ def refine_subtitle_timings(model, audio_path, subtitles, duration):
             "end": end,
         })
 
-    return refined_subtitles
+    return rescue_suspicious_timings(audio_path, subtitles, refined_subtitles, duration)
 
 def main(input_file):
     start_time = time.time()
-    
+
     if not os.path.exists(input_file):
         print(json.dumps({"error": f"Input file not found: {input_file}"}), file=sys.stderr)
         sys.exit(1)
@@ -156,16 +328,40 @@ def main(input_file):
     cached_meta = {}
     results = None
     info = None
+    romanizer = kakasi()
 
     if os.path.exists(output_json_path):
         with open(output_json_path, "r", encoding="utf-8") as f:
             cached_data = json.load(f)
 
         cached_meta = cached_data.get("meta", {})
-        if cached_meta.get("timing_refinement_version", 0) >= TIMING_REFINEMENT_VERSION:
+        timing_current = cached_meta.get("timing_refinement_version", 0) >= TIMING_REFINEMENT_VERSION
+        romaji_current = cached_meta.get("romaji_version", 0) >= ROMAJI_VERSION
+
+        if timing_current and romaji_current:
             print("\n[!] CACHE LOADED: Refined JSON found. Skipping transcription.\n", file=sys.stderr)
             save_srt(cached_data["subtitles"], output_srt_romaji, "text_romaji")
             save_srt(cached_data["subtitles"], output_srt_kanji, "text_jp")
+            return
+
+        if timing_current:
+            print("\n[!] CACHE LOADED: Refined JSON found. Refreshing romaji output.\n", file=sys.stderr)
+            refreshed_subtitles = rebuild_subtitles_romaji(cached_data["subtitles"], romanizer)
+            refreshed_meta = dict(cached_meta)
+            refreshed_meta["processing_time"] = round(time.time() - start_time, 2)
+            refreshed_meta["romaji_version"] = ROMAJI_VERSION
+            refreshed_meta["romaji_converter"] = "pykakasi-hepburn"
+
+            refreshed_output = {
+                "meta": refreshed_meta,
+                "subtitles": refreshed_subtitles,
+            }
+
+            with open(output_json_path, "w", encoding="utf-8") as f:
+                json.dump(refreshed_output, f, ensure_ascii=False, indent=2)
+
+            save_srt(refreshed_subtitles, output_srt_romaji, "text_romaji")
+            save_srt(refreshed_subtitles, output_srt_kanji, "text_jp")
             return
 
         if cached_meta.get("timing_refined"):
@@ -175,11 +371,11 @@ def main(input_file):
         results = cached_data["subtitles"]
 
     os.makedirs(TEMP_DIR, exist_ok=True)
-    
+
     # 1. SEPARATE VOCALS
     search_pattern = os.path.join(TEMP_DIR, f"*{base_name}*(Vocals)*.wav")
     found_files = glob.glob(search_pattern)
-    
+
     # Filter out previously normalized files to prevent 'normalized_normalized_' looping
     raw_files = [f for f in found_files if not os.path.basename(f).startswith("normalized_")]
     raw_vocals_path = None
@@ -197,7 +393,7 @@ def main(input_file):
     # 2. NORMALIZE AUDIO
     normalized_vocals_path = os.path.join(TEMP_DIR, f"normalized_{os.path.basename(raw_vocals_path)}")
     duration = get_audio_duration(raw_vocals_path)
-    
+
     if not os.path.exists(normalized_vocals_path):
         normalize_audio(raw_vocals_path, normalized_vocals_path, duration)
 
@@ -213,96 +409,93 @@ def main(input_file):
         compute_type=whisper_compute_type,
     )
 
-    katsu = cutlet.Cutlet() 
-    
-    # use_foreign_spelling
-    # Default: True
-    # Description: Attempts to reverse-engineer katakana loan words back into English (パーティー -> party).
-    # Reasoning: Set to False. We want pure phonetic Romaji (paatii) so the text perfectly matches the sounds coming out of the characters' mouths.
-    katsu.use_foreign_spelling = False 
-
     raw_segments_debug = []
+    if results is not None and os.path.exists(debug_json_path):
+        with open(debug_json_path, "r", encoding="utf-8") as f:
+            raw_segments_debug = json.load(f)
+        results = build_subtitles_from_raw_segments(raw_segments_debug, romanizer)
+
     if results is None:
         results = []
 
         # 3. TRANSCRIBE
         print(json.dumps({"status": "transcribing"}), file=sys.stderr)
         segments_generator, info = model.transcribe(
-            normalized_vocals_path, 
-            
+            normalized_vocals_path,
+
             # language
             # Default: None (Auto-detect)
             # Description: The language of the audio.
             # Reasoning: Forced to "ja" to skip the detection phase and prevent the AI from arbitrarily switching languages mid-episode.
-            language="ja", 
-            
+            language="ja",
+
             # beam_size
             # Default: 5
             # Description: Number of parallel paths the AI evaluates to find the most accurate translation.
             # Reasoning: Kept at 5. Offers the best balance between high accuracy and VRAM usage.
-            beam_size=5,    
-            
+            beam_size=5,
+
             # patience
             # Default: 1.0
             # Description: How long the beam search waits to finalize a complex sentence path.
             # Reasoning: Kept at 1.0. Ensures high logical accuracy on long anime monologues.
-            patience=1.0,   
-            
+            patience=1.0,
+
             # condition_on_previous_text
             # Default: True
             # Description: Feeds the previously transcribed text into the current window to provide context.
             # Reasoning: Set to False. Anime has long musical/silent breaks. Context windowing causes the AI to hallucinate and repeat the previous line endlessly during silences.
-            condition_on_previous_text=False, 
-            
+            condition_on_previous_text=False,
+
             # initial_prompt
             # Default: None
             # Description: A string of text fed to the AI before it starts transcribing.
             # Reasoning: Subliminally forces the AI to use proper Japanese punctuation (。、) and permits it to output English characters (Hello) for loan words.
-            initial_prompt="こんにちは。Hello。今日はいい天気ですね。", 
-            
+            initial_prompt="こんにちは。Hello。今日はいい天気ですね。",
+
             # vad_filter
             # Default: False
             # Description: Enables Silero Voice Activity Detection to skip silent parts of the audio.
             # Reasoning: Set to True. Starves the AI of static and tape hiss, drastically reducing hallucinations.
             vad_filter=True,
-            
+
             vad_parameters=dict(
                 # threshold
                 # Default: 0.5
                 # Description: Confidence threshold (0.0 to 1.0) for detecting speech.
                 # Reasoning: Back to default 0.5. 0.4 was too sensitive and allowed room tone to bridge gaps between words.
-                threshold=0.5,                
-                
+                threshold=0.5,
+
                 # min_speech_duration_ms
                 # Default: 250
                 # Description: Minimum length of a sound to be considered speech.
                 # Reasoning: Kept at 250ms. Prevents random micro-noises (door clicks, footsteps) from triggering transcription.
-                min_speech_duration_ms=250,   
-                
+                min_speech_duration_ms=250,
+
                 # min_silence_duration_ms
                 # Default: 2000
                 # Description: How much silence must occur before the VAD cuts a segment.
                 # Reasoning: TIGHTENED to 500ms. 1000ms was too long, causing the VAD to stretch subtitles across long pauses. Half a second is a natural boundary.
-                min_silence_duration_ms=500, 
-                
+                min_silence_duration_ms=500,
+
                 # speech_pad_ms
                 # Default: 400
                 # Description: Extra audio buffer added before and after detected speech.
                 # Reasoning: TIGHTENED to 150ms. 400ms artificially inflated the visual duration of the subtitle. 150ms is just enough to catch the trailing breath without lingering on screen.
-                speech_pad_ms=150             
+                speech_pad_ms=150
             ),
-            
+
             # word_timestamps
             # Default: False
             # Description: Uses Dynamic Time Warping (DTW) to calculate millisecond timings for individual words.
             # Reasoning: STRICTLY FALSE. DTW fundamentally misunderstands Japanese trailing vowels and shrinks boundaries or snaps to static. We are relying entirely on the VAD segment bounds.
-            word_timestamps=False, 
-            
+            word_timestamps=False,
+
             # hallucination_silence_threshold
             # Default: None
             # Description: Drops transcriptions if they are stretched across massive silences.
             # Reasoning: Set to 2.0s. Failsafe to prevent the "Early Anchor" bug where a word is artificially snapped 10 seconds early to background noise.
-            hallucination_silence_threshold=2.0 
+            hallucination_silence_threshold=2.0
         )
 
         with tqdm(total=duration, unit='s', desc="Transcribing", file=sys.stderr) as pbar:
@@ -319,7 +512,7 @@ def main(input_file):
                         "start": round(segment.start, 3),
                         "end": round(segment.end, 3),
                         "text_jp": text_jp,
-                        "text_romaji": katsu.romaji(text_jp).strip()
+                        "text_romaji": romanize_text(text_jp, romanizer)
                     })
                 pbar.update(segment.end - pbar.n)
 
@@ -332,13 +525,15 @@ def main(input_file):
     total_time = time.time() - start_time
     output_meta = dict(cached_meta)
     output_meta["processing_time"] = round(total_time, 2)
-    output_meta["model"] = "large-v3-faster-stable-ts-align_words"
+    output_meta["model"] = "large-v3-faster-stable-ts-align_words-mms-rescue"
     output_meta["timing_refined"] = True
-    output_meta["timing_refiner"] = "stable-ts-align_words"
+    output_meta["timing_refiner"] = "stable-ts-align_words+mms-forced-align-rescue"
     output_meta["timing_refinement_version"] = TIMING_REFINEMENT_VERSION
     output_meta["timing_alignment_audio"] = "mixed_track_mono_16k"
     output_meta["whisper_device"] = whisper_device
     output_meta["whisper_compute_type"] = whisper_compute_type
+    output_meta["romaji_version"] = ROMAJI_VERSION
+    output_meta["romaji_converter"] = "pykakasi-hepburn"
     output_meta["transcription_model"] = output_meta.get("transcription_model", cached_meta.get("model", "large-v3-faster-raw"))
     if info is not None:
         output_meta["language"] = info.language
@@ -357,12 +552,12 @@ def main(input_file):
 
     save_srt(results, output_srt_romaji, "text_romaji")
     save_srt(results, output_srt_kanji, "text_jp")
-    
+
     print(json.dumps({"status": "done"}), file=sys.stderr)
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         print(json.dumps({"error": "Usage: python process_audio.py <video_file>"}), file=sys.stderr)
         sys.exit(1)
-        
+
     main(sys.argv[1])

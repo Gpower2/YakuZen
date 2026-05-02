@@ -17,17 +17,21 @@ YakuZen is a desktop subtitle-generation app for Japanese anime video files. It 
    - Separates the vocal stem with `audio_separator`
    - Normalizes the stem with FFmpeg loudness normalization and resamples it to 16 kHz
    - Transcribes Japanese speech with `faster-whisper` `large-v3` on CUDA
-   - Runs a second-pass timing refinement with `stable-ts align_words()` against a cached mono 16 kHz extract of the original episode mix to tighten subtitle boundaries without changing the subtitle count
-   - Converts the Japanese transcript to phonetic romaji with `cutlet`
+   - Runs a second-pass timing refinement with `stable-ts align_words()` against a cached mono 16 kHz extract of the original episode mix
+   - Runs an extra rescue pass for suspiciously long sparse cues with torchaudio MMS forced alignment plus `pykakasi` romanization to recover late-starting dialogue that stable-ts still anchors too early
+   - Converts the Japanese transcript to phonetic romaji with `pykakasi`, including cache-only romaji refreshes for older outputs
    - Writes `<base>.json`, `<base>.kanji.srt`, `<base>.romaji.srt`, and `<base>_debug_raw.json`
 3. `src\translate_subs.py` handles translation and final export:
    - Reuses `<base>_translated.json` if present
-   - Sends subtitle batches to Ollama at `http://localhost:11434/api/generate`
-   - Expects a 1:1 JSON array of English strings and falls back to single-line translation when batch output is malformed
+   - Infers the anime series title from the input filename and feeds it to the translator so character, organization, and place names have immediate context
+   - Uses Ollama at `http://localhost:11434/api/generate`; the default model is `qwen3:14b`, while `translategemma:12b` remains available as an optional translation-specialist alternative
+   - Uses context-aware batch prompting for general chat models, but switches to direct subtitle-style prompts for translation-specialist models like TranslateGemma
+   - Repairs fragmentary multi-cue translations by retranslating the combined Japanese window once, splitting that natural English sentence back across the original cues, and storing a merged viewer-facing line for export
+   - Post-processes the final `.en.srt` so oversized display cues are split back into timed subtitle chunks of at most two lines, preferring punctuation boundaries such as `!`, `?`, and sentence breaks when possible
    - Writes `<base>_translated.json`, `<base>.jp.srt`, `<base>.romaji.srt`, `<base>.en.raw.srt`, and `<base>.en.srt`
 4. `src\check_gpu.py` is a diagnostics script that checks PyTorch CUDA support, ONNX Runtime providers, and `faster-whisper` GPU loading.
 
-The English export has two forms: `.en.raw.srt` keeps the original segment timing 1:1, while `.en.srt` wraps long lines and proportionally splits oversized subtitles into multiple timed chunks.
+The English export has two forms: `.en.raw.srt` keeps the original segment timing 1:1 for debugging, while `.en.srt` merges repaired fragment windows into viewer-facing display cues and then splits oversized English subtitles back into timed chunks capped at two on-screen lines.
 
 ## Dependencies
 
@@ -37,20 +41,21 @@ Python dependencies are declared in `pyproject.toml`.
 
 - `audio-separator`
 - `customtkinter`
-- `cutlet`
 - `faster-whisper`
 - `onnxruntime-gpu` on Windows/Linux, `onnxruntime` on macOS
+- `pykakasi`
 - `requests`
 - `stable-ts[fw]`
 - `torch`
+- `torchaudio`
 - `tqdm`
-- `unidic-lite`
 
 ### External tools and services
 
 - `ffmpeg` and `ffprobe` available on `PATH`
 - Ollama running locally on `http://localhost:11434`
 - A local Ollama model downloaded in advance; `translate_subs.py` currently defaults to `qwen3:14b`
+- `translategemma:12b` is an optional alternative if you want to compare a translation-specialist model
 - `audio_separator` model assets cached/downloaded under `.\temp`
 
 ## Platform support
@@ -63,7 +68,7 @@ Python dependencies are declared in `pyproject.toml`.
 
 Across all operating systems, launch the GUI from the `src` directory because `app.py` starts sibling scripts by bare filename.
 
-Existing subtitle JSON caches without the current timing-refinement version are treated as upgradeable transcripts: the app can reuse the cached text and rerun only the timing-refinement stage.
+Existing subtitle JSON caches without the current timing-refinement version are treated as upgradeable transcripts: the app can reuse the cached text and rerun only the timing-refinement stage. Translated caches are stricter: if the inferred series title, default translation model, or translation prompt version changes, `translate_subs.py` will regenerate the English cache instead of silently reusing stale wording.
 
 ## Installing dependencies
 
@@ -88,6 +93,7 @@ Existing subtitle JSON caches without the current timing-refinement version are 
 4. Start Ollama and pull the translation model:
    ```powershell
    ollama pull qwen3:14b
+   ollama pull translategemma:12b
    ```
 
 ### Linux
@@ -113,6 +119,7 @@ Existing subtitle JSON caches without the current timing-refinement version are 
    ```bash
    ollama serve
    ollama pull qwen3:14b
+   ollama pull translategemma:12b
    ```
 
 ### macOS
@@ -132,6 +139,7 @@ Existing subtitle JSON caches without the current timing-refinement version are 
    ```bash
    ollama serve
    ollama pull qwen3:14b
+   ollama pull translategemma:12b
    ```
 4. Expect the audio pipeline to run on CPU unless you adapt the project to a different backend; the committed code now handles that fallback automatically.
 

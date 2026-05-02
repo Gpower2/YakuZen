@@ -11,15 +11,15 @@ requires-python = ">=3.10,<3.13"
 dependencies = [
   "audio-separator",
   "customtkinter",
-  "cutlet",
   "faster-whisper",
   "onnxruntime-gpu; platform_system != 'Darwin'",
   "onnxruntime; platform_system == 'Darwin'",
+  "pykakasi",
   "requests",
   "stable-ts[fw]",
   "torch",
+  "torchaudio",
   "tqdm",
-  "unidic-lite",
 ]
 
 [tool.setuptools]
