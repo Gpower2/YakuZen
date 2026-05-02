@@ -29,6 +29,13 @@ DEFAULT_ASR_SOURCE = "mix"
 DEFAULT_ASR_MODEL = "large-v3"
 SUPPORTED_ASR_SOURCES = ("mix", "raw_vocals", "normalized_vocals")
 SUPPORTED_ASR_MODELS = ("large-v3", "kotoba-whisper-v1.1", "hybrid")
+DEFAULT_ASR_INITIAL_PROMPT = "こんにちは。Hello。今日はいい天気ですね。"
+TITLE_NOISE_TOKENS = {
+    "AMZN", "AMZNWEBRIP", "WEB", "WEBRIP", "WEBDL", "WEB-DL", "BD", "BDRIP", "BLURAY", "BRRIP",
+    "DVDRIP", "HDRIP", "REMUX", "NF", "DSNP", "CR", "ATVP", "FUNI", "HULU", "1080P", "720P",
+    "480P", "2160P", "4K", "UHD", "HEVC", "X264", "X265", "H264", "H265", "AAC", "DDP", "AC3",
+    "TRUEHD", "DTS", "10BIT", "8BIT", "MULTI", "SUBS", "DUB", "RAW", "BK", "JPN", "ENG",
+}
 LEGACY_ASR_SOURCE = "normalized_vocals"
 KOTOBA_MODEL_ID = "kotoba-tech/kotoba-whisper-v1.1"
 KOTOBA_CHUNK_LENGTH_S = 20
@@ -46,6 +53,7 @@ HYBRID_MAX_SEGMENT_COUNT_DROP = 2
 HYBRID_MAX_CANDIDATE_SEGMENT_DURATION = 18.0
 TIMING_REFINEMENT_VAD_THRESHOLD = 0.35
 TIMING_REFINEMENT_VERSION = 6
+TRANSCRIPTION_PROMPT_VERSION = 3
 ROMAJI_VERSION = 2
 SUSPICIOUS_SEGMENT_MIN_DURATION = 8.0
 SUSPICIOUS_SEGMENT_MAX_CHARS_PER_SECOND = 2.5
@@ -137,6 +145,78 @@ def separator_output_tag(separator_model):
     stem = os.path.splitext(normalize_separator_model_name(separator_model))[0]
     return re.sub(r"\.\d+$", "", stem)
 
+def infer_series_title(input_path):
+    stem = os.path.splitext(os.path.basename(input_path))[0]
+    tokens = [token for token in re.split(r"[._\-\s]+", stem) if token]
+    title_tokens = []
+    year_token = None
+
+    for raw_token in tokens:
+        token = raw_token.strip()
+        upper_token = token.upper()
+
+        if re.match(r"^(S\d{1,2}E\d{1,3}|E\d{1,3}|EP?\d{1,3}|OVA\d*|OAD\d*|NCOP\d*|NCED\d*)$", upper_token):
+            break
+
+        if re.match(r"^(19|20)\d{2}$", token):
+            year_token = token
+            continue
+
+        if upper_token in TITLE_NOISE_TOKENS:
+            if title_tokens:
+                break
+            continue
+
+        if re.match(r"^\d{3,4}P$", upper_token) or re.match(r"^(Q\d|REMASTER)$", upper_token):
+            if title_tokens:
+                break
+            continue
+
+        title_tokens.append(token)
+
+    if not title_tokens:
+        fallback = re.sub(r"[._\-]+", " ", stem).strip()
+        return fallback or stem
+
+    title = " ".join(title_tokens).strip()
+    if year_token:
+        return f"{title} ({year_token})"
+    return title
+
+def normalize_series_title_for_prompt(series_title):
+    if not series_title:
+        return ""
+    return re.sub(r"\s*\((19|20)\d{2}\)\s*$", "", str(series_title)).strip()
+
+def build_asr_initial_prompt(series_title=None):
+    title_hint = normalize_series_title_for_prompt(series_title)
+    if not title_hint:
+        return DEFAULT_ASR_INITIAL_PROMPT
+    return f"こんにちは。{title_hint}。Hello。今日はいい天気ですね。"
+
+def build_asr_hotwords(series_title=None):
+    title_hint = normalize_series_title_for_prompt(series_title)
+    if not title_hint:
+        return None
+
+    candidates = [title_hint]
+    condensed = re.sub(r"\s+", "", title_hint)
+    if condensed and condensed.casefold() != title_hint.casefold():
+        candidates.append(condensed)
+
+    unique_candidates = []
+    seen = set()
+    for candidate in candidates:
+        normalized_candidate = candidate.strip()
+        key = normalized_candidate.casefold()
+        if normalized_candidate and key not in seen:
+            seen.add(key)
+            unique_candidates.append(normalized_candidate)
+
+    if not unique_candidates:
+        return None
+    return ", ".join(unique_candidates)
+
 def find_cached_raw_vocals(base_name, separator_model):
     search_pattern = os.path.join(
         TEMP_DIR,
@@ -160,12 +240,17 @@ def normalize_cached_asr_model(cached_meta):
         return "kotoba-whisper-v1.1"
     return "large-v3"
 
-def transcription_settings_match(cached_meta, asr_source, asr_model, separator_model):
+def transcription_settings_match(cached_meta, asr_source, asr_model, separator_model, series_title):
     cached_source = cached_meta.get("transcription_source", LEGACY_ASR_SOURCE)
     cached_model = normalize_cached_asr_model(cached_meta)
     cached_separator = cached_meta.get("separator_model", DEFAULT_SEPARATOR_MODEL)
+    cached_prompt_version = cached_meta.get("transcription_prompt_version", 0)
+    cached_series_title = cached_meta.get("transcription_series_title")
 
     if cached_source != asr_source or cached_model != asr_model:
+        return False
+
+    if cached_prompt_version != TRANSCRIPTION_PROMPT_VERSION or cached_series_title != series_title:
         return False
 
     if asr_source == "mix":
@@ -529,12 +614,13 @@ def should_accept_hybrid_candidate(base_segments, candidate_segments, reasons):
 
     return False
 
-def transcribe_with_hybrid(alignment_model, transcription_audio_path, transcription_duration, alignment_audio_path, alignment_duration, romanizer):
+def transcribe_with_hybrid(alignment_model, transcription_audio_path, transcription_duration, alignment_audio_path, alignment_duration, romanizer, series_title=None):
     print("5% Running faster-whisper baseline...", file=sys.stderr)
     base_segments, info = transcribe_with_faster_whisper(
         alignment_model,
         transcription_audio_path,
         transcription_duration,
+        series_title=series_title,
     )
 
     print("45% Refining baseline timings for hybrid comparison...", file=sys.stderr)
@@ -720,7 +806,8 @@ def refine_subtitle_timings(model, audio_path, subtitles, duration):
 
     return rescue_suspicious_timings(audio_path, subtitles, refined_subtitles, duration)
 
-def transcribe_with_faster_whisper(model, audio_path, duration):
+def transcribe_with_faster_whisper(model, audio_path, duration, series_title=None):
+    hotwords = build_asr_hotwords(series_title)
     transcription_result = model.transcribe(
         audio_path,
 
@@ -752,7 +839,13 @@ def transcribe_with_faster_whisper(model, audio_path, duration):
         # Default: None
         # Description: A string of text fed to the AI before it starts transcribing.
         # Reasoning: Subliminally forces the AI to use proper Japanese punctuation (。、) and permits it to output English characters (Hello) for loan words.
-        initial_prompt="こんにちは。Hello。今日はいい天気ですね。",
+        initial_prompt=build_asr_initial_prompt(series_title),
+
+        # hotwords
+        # Default: None
+        # Description: A comma-separated list of tokens that stay active as decoding hints across the whole file.
+        # Reasoning: Keeps inferred series titles available even with condition_on_previous_text disabled so late-episode title mentions drift less often.
+        hotwords=hotwords,
 
         # vad_filter
         # Default: False
@@ -900,6 +993,7 @@ def main(input_file, asr_source=DEFAULT_ASR_SOURCE, asr_model=DEFAULT_ASR_MODEL,
 
     base_name = os.path.splitext(os.path.basename(input_file))[0]
     dir_name = os.path.dirname(input_file)
+    series_title = infer_series_title(input_file)
     output_json_path = os.path.join(dir_name, f"{base_name}.json")
     output_srt_romaji = os.path.join(dir_name, f"{base_name}.romaji.srt")
     output_srt_kanji = os.path.join(dir_name, f"{base_name}.kanji.srt")
@@ -917,7 +1011,13 @@ def main(input_file, asr_source=DEFAULT_ASR_SOURCE, asr_model=DEFAULT_ASR_MODEL,
             cached_data = json.load(f)
 
         cached_meta = cached_data.get("meta", {})
-        config_matches = transcription_settings_match(cached_meta, asr_source, asr_model, selected_separator_model)
+        config_matches = transcription_settings_match(
+            cached_meta,
+            asr_source,
+            asr_model,
+            selected_separator_model,
+            series_title,
+        )
 
         if not config_matches:
             print(
@@ -1015,6 +1115,7 @@ def main(input_file, asr_source=DEFAULT_ASR_SOURCE, asr_model=DEFAULT_ASR_MODEL,
                 alignment_model,
                 transcription_audio_path,
                 transcription_duration,
+                series_title=series_title,
             )
         elif asr_model == "kotoba-whisper-v1.1":
             raw_segments_debug, info = transcribe_with_kotoba(
@@ -1029,6 +1130,7 @@ def main(input_file, asr_source=DEFAULT_ASR_SOURCE, asr_model=DEFAULT_ASR_MODEL,
                 alignment_audio_path,
                 alignment_duration,
                 romanizer,
+                series_title=series_title,
             )
         else:
             raise ValueError(f"Unsupported ASR model: {asr_model}")
@@ -1056,6 +1158,9 @@ def main(input_file, asr_source=DEFAULT_ASR_SOURCE, asr_model=DEFAULT_ASR_MODEL,
     output_meta["romaji_version"] = ROMAJI_VERSION
     output_meta["romaji_converter"] = "pykakasi-hepburn"
     output_meta["transcription_model"] = asr_model
+    output_meta["transcription_series_title"] = series_title
+    output_meta["transcription_prompt_version"] = TRANSCRIPTION_PROMPT_VERSION
+    output_meta["transcription_hotwords"] = build_asr_hotwords(series_title)
     if asr_model == "large-v3":
         output_meta["transcription_backend"] = "faster-whisper"
     elif asr_model == "hybrid":

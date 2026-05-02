@@ -55,7 +55,7 @@ CONTEXT_SIZE = 3
 # helps avoid dangling English fragments at batch boundaries without breaking 1-to-1 output alignment.
 LOOKAHEAD_SIZE = 3
 
-TRANSLATION_PROMPT_VERSION = 6
+TRANSLATION_PROMPT_VERSION = 7
 TRANSLATION_REPAIR_VERSION = 4
 FRAGMENT_WINDOW_SIZE = 3
 FRAGMENT_WINDOW_MAX_GAP = 1.0
@@ -158,9 +158,11 @@ def format_context_list(items):
 def build_series_context_block(series_title):
     if not series_title:
         return ""
+    canonical_title = re.sub(r"\s*\((19|20)\d{2}\)\s*$", "", str(series_title)).strip()
     return (
         "ANIME SERIES CONTEXT:\n"
         f"- Inferred series title from the filename: {series_title}\n"
+        f"- If a noisy or fragmented line appears to refer to the series title, prefer the exact English title spelling \"{canonical_title}\".\n"
         "- Use this only to keep character names, organizations, places, and technical terms consistent if you recognize the series.\n\n"
     )
 
@@ -171,8 +173,9 @@ def build_translation_context_note(previous_context=None, next_context=None, ser
     notes = []
 
     if series_title:
+        canonical_title = re.sub(r"\s*\((19|20)\d{2}\)\s*$", "", str(series_title)).strip()
         notes.append(
-            f'This subtitle comes from the anime series "{series_title}". Keep character names, places, organizations, and technical terms consistent if you recognize them.'
+            f'This subtitle comes from the anime series "{series_title}". Keep character names, places, organizations, and technical terms consistent if you recognize them, and if a noisy line seems to point at the title, prefer the exact English title "{canonical_title}".'
         )
 
     previous_items = [str(item).strip() for item in (previous_context or []) if str(item).strip()]
@@ -195,9 +198,10 @@ def build_translation_context_note(previous_context=None, next_context=None, ser
 def build_direct_translation_prompt(text_jp, previous_context=None, next_context=None, series_title=None):
     context_sentence = ""
     if series_title:
+        canonical_title = re.sub(r"\s*\((19|20)\d{2}\)\s*$", "", str(series_title)).strip()
         context_sentence = (
             f' This subtitle comes from the anime series "{series_title}". '
-            "Keep character names, places, organizations, and technical terms consistent if you recognize them."
+            f'Keep character names, places, organizations, and technical terms consistent if you recognize them. If a noisy line seems to refer to the title, prefer the exact English title "{canonical_title}".'
         )
     return (
         f"You are a professional {SOURCE_LANGUAGE_NAME} ({SOURCE_LANGUAGE_CODE}) to {TARGET_LANGUAGE_NAME} ({TARGET_LANGUAGE_CODE}) translator. "
@@ -478,8 +482,9 @@ def extract_json_array(raw_text):
 
 def call_ollama(prompt, system_prompt=SYSTEM_PROMPT, options=None):
     payload_options = {
-        "temperature": 0.1,
+        "temperature": 0.0,
         "num_ctx": 4096,
+        "seed": 0,
     }
     if options:
         payload_options.update(options)

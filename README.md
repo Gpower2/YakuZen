@@ -20,14 +20,16 @@ YakuZen is a desktop subtitle-generation app for Japanese anime video files. It 
    - Extracts a mono 16 kHz copy of the original episode mix and now uses that **mixed track** as the default ASR source
    - Keeps the raw separated vocal stem available as an advanced alternative, while the old loudness-normalized stem remains available as a legacy option
    - Transcribes Japanese speech with `faster-whisper` `large-v3` by default on CUDA, with `kotoba-whisper-v1.1` exposed as an advanced alternative and a `hybrid` Whisper+Kotoba rescue mode exposed as an experimental option
+   - Infers the series title from the filename and feeds that title into the default Whisper path as both a front-loaded initial prompt hint and persistent hotwords so recurring titles and proper nouns drift less often on fresh reruns
    - Runs a second-pass timing refinement with `stable-ts align_words()` against a cached mono 16 kHz extract of the original episode mix
    - Runs an extra rescue pass for suspiciously long sparse cues with torchaudio MMS forced alignment plus `pykakasi` romanization to recover late-starting dialogue that stable-ts still anchors too early
    - Converts the Japanese transcript to phonetic romaji with `pykakasi`, including cache-only romaji refreshes for older outputs
    - Writes `<base>.json`, `<base>.kanji.srt`, `<base>.romaji.srt`, and `<base>_debug_raw.json`
 3. `src\translate_subs.py` handles translation and final export:
    - Reuses `<base>_translated.json` if present
-   - Infers the anime series title from the input filename and feeds it to the translator so character, organization, and place names have immediate context
+   - Infers the anime series title from the input filename and feeds it to the translator so character, organization, place, and series-title references have immediate context
    - Uses Ollama at `http://localhost:11434/api/generate`; the default model is `qwen3:14b`, and the translation model is now configurable from both the CLI and desktop app
+   - Uses deterministic Ollama decoding by default so fresh reruns stop drifting between equally valid English phrasings when the Japanese input is unchanged
    - Uses context-aware batch prompting for general chat models, but switches to direct subtitle-style prompts for translation-specialist models like TranslateGemma
    - Repairs fragmentary multi-cue translations by retranslating the combined Japanese window once, splitting that natural English sentence back across the original cues, and storing a merged viewer-facing line for export
    - Post-processes the final `.en.srt` so oversized display cues are split back into timed subtitle chunks of at most two lines, preferring punctuation boundaries such as `!`, `?`, and sentence breaks when possible
@@ -75,7 +77,7 @@ Python dependencies are declared in `pyproject.toml`.
 
 Across all operating systems, launch the GUI from the `src` directory because `app.py` starts sibling scripts by bare filename.
 
-Existing subtitle JSON caches without the current timing-refinement version are treated as upgradeable transcripts: the app can reuse the cached text and rerun only the timing-refinement stage. Full transcript caches are also keyed by the selected transcription source, ASR model, and relevant separator checkpoint, so changing those options intentionally regenerates the Japanese transcript. Translated caches are stricter: if the inferred series title, translation model, or translation prompt version changes, `translate_subs.py` will regenerate the English cache instead of silently reusing stale wording.
+Existing subtitle JSON caches without the current timing-refinement version are treated as upgradeable transcripts: the app can reuse the cached text and rerun only the timing-refinement stage. Full transcript caches are also keyed by the selected transcription source, ASR model, inferred series title, transcription prompt version, and relevant separator checkpoint, so changing those options intentionally regenerates the Japanese transcript. Translated caches are stricter: if the inferred series title, translation model, or translation prompt version changes, `translate_subs.py` will regenerate the English cache instead of silently reusing stale wording.
 
 ## Installing dependencies
 
@@ -203,6 +205,8 @@ The shipped defaults are intentionally conservative:
 - **Translation model**: `qwen3:14b`
 
 That combination gave the best balance of subtitle coverage, timing stability, and low-friction behavior in the bundled sample tests. `kotoba-whisper-v1.1` remains available as an advanced option when you want to experiment with better Japanese wording/proper-noun recovery, but it currently merges cues more aggressively and is therefore not the default.
+
+The default `large-v3` path is also title-aware now: it infers the series title from the filename and uses that as a light Whisper bias (front-loaded prompt + hotwords). In fresh isolated reruns this substantially reduced late-episode title drift on the bundled Blue Noah sample without turning `condition_on_previous_text` back on.
 
 The new **`hybrid`** mode is available for experimentation when you want Whisper to keep the baseline segmentation while Kotoba tries to improve selected suspicious windows. It is intentionally **not** the default yet: on the bundled sample it improved some proper-noun phrasing, but it can still produce longer merged Japanese cues or partial noisy phrases in rescue windows.
 
