@@ -227,10 +227,10 @@ In practice, this means the hybrid mode is trying to recover **proper nouns** an
 ```powershell
 .\.venv\Scripts\Activate.ps1
 Set-Location src
-python process_audio.py ..\sample\Blue.Noah.1979.S01E01.AMZN.WEBRip.BK.mkv --asr-source mix --asr-model large-v3
-python process_audio.py ..\sample\Blue.Noah.1979.S01E01.AMZN.WEBRip.BK.mkv --asr-source mix --asr-model hybrid
-python process_audio.py ..\sample\Blue.Noah.1979.S01E01.AMZN.WEBRip.BK.mkv --asr-source mix --asr-model kotoba-whisper-v1.1
-python translate_subs.py ..\sample\Blue.Noah.1979.S01E01.AMZN.WEBRip.BK.json --translation-model qwen3:14b
+python process_audio.py ..\sample\sample_video.mkv --asr-source mix --asr-model large-v3
+python process_audio.py ..\sample\sample_video.mkv --asr-source mix --asr-model hybrid
+python process_audio.py ..\sample\sample_video.mkv --asr-source mix --asr-model kotoba-whisper-v1.1
+python translate_subs.py ..\sample\sample_video.json --translation-model qwen3:14b
 python check_gpu.py
 ```
 
@@ -239,9 +239,9 @@ python check_gpu.py
 ```bash
 source .venv/bin/activate
 cd src
-python process_audio.py ../sample/Blue.Noah.1979.S01E01.AMZN.WEBRip.BK.mkv --asr-source mix --asr-model large-v3
-python process_audio.py ../sample/Blue.Noah.1979.S01E01.AMZN.WEBRip.BK.mkv --asr-source mix --asr-model hybrid
-python process_audio.py ../sample/Blue.Noah.1979.S01E01.AMZN.WEBRip.BK.mkv --asr-source mix --asr-model kotoba-whisper-v1.1
-python translate_subs.py ../sample/Blue.Noah.1979.S01E01.AMZN.WEBRip.BK.json --translation-model qwen3:14b
+python process_audio.py ../sample/sample_video.mkv --asr-source mix --asr-model large-v3
+python process_audio.py ../sample/sample_video.mkv --asr-source mix --asr-model hybrid
+python process_audio.py ../sample/sample_video.mkv --asr-source mix --asr-model kotoba-whisper-v1.1
+python translate_subs.py ../sample/sample_video.json --translation-model qwen3:14b
 python check_gpu.py
 ```
