@@ -77,6 +77,9 @@ Existing subtitle JSON caches without the current timing-refinement version are 
 
 ## Installing dependencies
 
+> [!IMPORTANT]
+> The repository does **not** include a ready-made `.venv` directory. After cloning the repo, create `.venv` locally in the repository root, activate it, and only then install dependencies or run the app. The command examples below assume you start in the repository root.
+
 ### Windows
 
 1. Install system dependencies:
@@ -91,6 +94,7 @@ Existing subtitle JSON caches without the current timing-refinement version are 
    python -m pip install --upgrade pip
    pip install -e .
    ```
+   A fresh Windows `venv` created this way does include `.\.venv\Scripts\Activate.ps1` for **PowerShell**. If you are using **Command Prompt** instead, use `.\.venv\Scripts\activate.bat`.
 3. If you want GPU acceleration for Whisper and `torch.cuda.is_available()` is still `False`, reinstall PyTorch with a CUDA wheel that matches your system. Example for CUDA 12.8:
    ```powershell
    pip install --force-reinstall torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
@@ -153,14 +157,18 @@ Existing subtitle JSON caches without the current timing-refinement version are 
 ### Windows
 
 ```powershell
+py -3.12 -m venv .venv   # first time only
 .\.venv\Scripts\Activate.ps1
 Set-Location src
 python app.py
 ```
 
+The activation line above is the **PowerShell** script created by the Windows `venv` command shown above (`py -3.12 -m venv .venv`). Run it from the repository root. If you use **Command Prompt** instead of PowerShell, use `.\.venv\Scripts\activate.bat`.
+
 ### Linux
 
 ```bash
+python3 -m venv .venv    # first time only
 source .venv/bin/activate
 cd src
 python app.py
@@ -169,6 +177,7 @@ python app.py
 ### macOS
 
 ```bash
+python3 -m venv .venv    # first time only
 source .venv/bin/activate
 cd src
 python app.py
@@ -225,6 +234,7 @@ In practice, this means the hybrid mode is trying to recover **proper nouns** an
 ### Windows
 
 ```powershell
+py -3.12 -m venv .venv   # first time only
 .\.venv\Scripts\Activate.ps1
 Set-Location src
 python process_audio.py ..\sample\sample_video.mkv --asr-source mix --asr-model large-v3
@@ -237,6 +247,7 @@ python check_gpu.py
 ### Linux / macOS
 
 ```bash
+python3 -m venv .venv    # first time only
 source .venv/bin/activate
 cd src
 python process_audio.py ../sample/sample_video.mkv --asr-source mix --asr-model large-v3
