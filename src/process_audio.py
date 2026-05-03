@@ -13,12 +13,8 @@ import argparse
 import numpy as np
 from datetime import timedelta
 from tqdm import tqdm
-import stable_whisper
-import torch
-import torchaudio
-from audio_separator.separator import Separator
-from pykakasi import kakasi
 
+from ffmpeg_utils import ensure_ffmpeg_tools_available
 from ollama_utils import call_ollama_model
 from pipeline_profiles import (
     BALANCED_PIPELINE_MODE,
@@ -39,6 +35,14 @@ from series_context import (
     resolve_series_context,
     series_context_hash,
 )
+
+FFMPEG_BINARIES = ensure_ffmpeg_tools_available()
+
+import stable_whisper
+import torch
+import torchaudio
+from audio_separator.separator import Separator
+from pykakasi import kakasi
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
@@ -114,7 +118,7 @@ def normalize_audio(input_path, output_path, duration):
     # loudnorm-normalized vocals as the primary ASR source can hurt subtitle coverage on
     # difficult scenes, so this is no longer the default transcription path.
     command = [
-        "ffmpeg", "-y", "-i", input_path,
+        FFMPEG_BINARIES.get("ffmpeg", "ffmpeg"), "-y", "-i", input_path,
         "-af", "loudnorm=I=-16:TP=-1.5:LRA=11",
         "-ar", "16000", output_path
     ]
@@ -136,7 +140,7 @@ def extract_alignment_audio(input_path, output_path):
     print(json.dumps({"status": "extracting_alignment_audio"}), file=sys.stderr)
 
     command = [
-        "ffmpeg", "-y", "-i", input_path,
+        FFMPEG_BINARIES.get("ffmpeg", "ffmpeg"), "-y", "-i", input_path,
         "-vn", "-ac", "1", "-ar", "16000", output_path
     ]
     subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -494,9 +498,23 @@ def collect_hybrid_rescue_windows(base_subtitles, duration):
 
 
 def merge_rescue_windows(rescue_windows):
-    rescue_windows.sort(key=lambda item: (item["window_start"], item["window_end"]))
-    merged_windows = []
+    normalized_windows = []
     for window in rescue_windows:
+        normalized_window = dict(window)
+        raw_reasons = normalized_window.get("reasons") or []
+        if isinstance(raw_reasons, str):
+            raw_reasons = [raw_reasons]
+        normalized_window["reasons"] = {
+            str(reason).strip()
+            for reason in raw_reasons
+            if str(reason).strip()
+        }
+        normalized_window.pop("id", None)
+        normalized_windows.append(normalized_window)
+
+    normalized_windows.sort(key=lambda item: (item["window_start"], item["window_end"]))
+    merged_windows = []
+    for window in normalized_windows:
         if not merged_windows:
             merged_windows.append(window)
             continue

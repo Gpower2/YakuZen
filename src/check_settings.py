@@ -10,6 +10,7 @@ from importlib import metadata
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 
+from ffmpeg_utils import ensure_ffmpeg_tools_available, find_ffmpeg_binary
 from pipeline_profiles import (
     CURRENT_PIPELINE_MODE,
     DEFAULT_CONTEXT_MODEL,
@@ -81,9 +82,9 @@ def module_available(module_name):
 
 
 def validate_command(command_name, errors):
-    path = shutil.which(command_name)
+    path = find_ffmpeg_binary(command_name) if command_name in {"ffmpeg", "ffprobe"} else shutil.which(command_name)
     if not path:
-        message = f"{command_name} was not found on PATH."
+        message = f"{command_name} was not found."
         log_fail(message)
         errors.append(message)
         return None
@@ -134,6 +135,7 @@ def validate_runtime_environment(args, errors, warnings):
     log_info(f"ASR source: {args.asr_source}")
     log_info(f"ASR model: {args.asr_model}")
 
+    ensure_ffmpeg_tools_available()
     validate_command("ffmpeg", errors)
     validate_command("ffprobe", errors)
     validate_python_module("torch", "torch", errors)

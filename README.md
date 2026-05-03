@@ -72,7 +72,7 @@ Python dependencies are declared in `pyproject.toml`.
 
 ### External tools and services
 
-- `ffmpeg` and `ffprobe` available on `PATH`
+- `ffmpeg` and `ffprobe` available on `PATH` (or installed in the standard Windows Winget location that YakuZen now auto-detects)
 - Ollama running locally on `http://localhost:11434`
 - A local Ollama model downloaded in advance; `translate_subs.py` currently defaults to `qwen3:14b`
 - `translategemma:12b` is an optional alternative if you want to compare a translation-specialist model
