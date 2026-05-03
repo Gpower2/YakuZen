@@ -19,6 +19,27 @@ import torchaudio
 from audio_separator.separator import Separator
 from pykakasi import kakasi
 
+from ollama_utils import call_ollama_model
+from pipeline_profiles import (
+    BALANCED_PIPELINE_MODE,
+    CURRENT_PIPELINE_MODE,
+    DEFAULT_CONTEXT_MODEL,
+    DEFAULT_JUDGE_MODEL,
+    MAX_PIPELINE_MODE,
+    SUPPORTED_PIPELINE_MODES,
+    mode_uses_context_fetch,
+    mode_uses_dual_source,
+    mode_uses_jp_judging,
+    mode_uses_maximum_jp_review,
+)
+from series_context import (
+    build_asr_hotword_list,
+    canonical_series_title,
+    infer_series_title as infer_series_title_from_target,
+    resolve_series_context,
+    series_context_hash,
+)
+
 warnings.filterwarnings("ignore", category=UserWarning)
 
 # --- CONFIGURATION ---
@@ -30,12 +51,6 @@ DEFAULT_ASR_MODEL = "large-v3"
 SUPPORTED_ASR_SOURCES = ("mix", "raw_vocals", "normalized_vocals")
 SUPPORTED_ASR_MODELS = ("large-v3", "kotoba-whisper-v1.1", "hybrid")
 DEFAULT_ASR_INITIAL_PROMPT = "こんにちは。Hello。今日はいい天気ですね。"
-TITLE_NOISE_TOKENS = {
-    "AMZN", "AMZNWEBRIP", "WEB", "WEBRIP", "WEBDL", "WEB-DL", "BD", "BDRIP", "BLURAY", "BRRIP",
-    "DVDRIP", "HDRIP", "REMUX", "NF", "DSNP", "CR", "ATVP", "FUNI", "HULU", "1080P", "720P",
-    "480P", "2160P", "4K", "UHD", "HEVC", "X264", "X265", "H264", "H265", "AAC", "DDP", "AC3",
-    "TRUEHD", "DTS", "10BIT", "8BIT", "MULTI", "SUBS", "DUB", "RAW", "BK", "JPN", "ENG",
-}
 LEGACY_ASR_SOURCE = "normalized_vocals"
 KOTOBA_MODEL_ID = "kotoba-tech/kotoba-whisper-v1.1"
 KOTOBA_CHUNK_LENGTH_S = 20
@@ -51,9 +66,10 @@ HYBRID_MIN_CANDIDATE_JAPANESE_CHARS = 6
 HYBRID_MIN_SCORE_DELTA = 3
 HYBRID_MAX_SEGMENT_COUNT_DROP = 2
 HYBRID_MAX_CANDIDATE_SEGMENT_DURATION = 18.0
+PROFILE_REVIEW_CONTEXT = 0.75
 TIMING_REFINEMENT_VAD_THRESHOLD = 0.35
 TIMING_REFINEMENT_VERSION = 6
-TRANSCRIPTION_PROMPT_VERSION = 3
+TRANSCRIPTION_PROMPT_VERSION = 5
 ROMAJI_VERSION = 2
 SUSPICIOUS_SEGMENT_MIN_DURATION = 8.0
 SUSPICIOUS_SEGMENT_MAX_CHARS_PER_SECOND = 2.5
@@ -63,6 +79,12 @@ HONORIFIC_ROMAJI_PREFIXES = {"お", "ご", "御"}
 
 _ctc_alignment_resources = None
 _kotoba_pipeline = None
+
+
+def emit_status(status, **payload):
+    message = {"status": status}
+    message.update(payload)
+    print(json.dumps(message), file=sys.stderr)
 
 def get_audio_duration(file_path):
     try:
@@ -146,76 +168,25 @@ def separator_output_tag(separator_model):
     return re.sub(r"\.\d+$", "", stem)
 
 def infer_series_title(input_path):
-    stem = os.path.splitext(os.path.basename(input_path))[0]
-    tokens = [token for token in re.split(r"[._\-\s]+", stem) if token]
-    title_tokens = []
-    year_token = None
+    return infer_series_title_from_target(input_path)
 
-    for raw_token in tokens:
-        token = raw_token.strip()
-        upper_token = token.upper()
-
-        if re.match(r"^(S\d{1,2}E\d{1,3}|E\d{1,3}|EP?\d{1,3}|OVA\d*|OAD\d*|NCOP\d*|NCED\d*)$", upper_token):
-            break
-
-        if re.match(r"^(19|20)\d{2}$", token):
-            year_token = token
-            continue
-
-        if upper_token in TITLE_NOISE_TOKENS:
-            if title_tokens:
-                break
-            continue
-
-        if re.match(r"^\d{3,4}P$", upper_token) or re.match(r"^(Q\d|REMASTER)$", upper_token):
-            if title_tokens:
-                break
-            continue
-
-        title_tokens.append(token)
-
-    if not title_tokens:
-        fallback = re.sub(r"[._\-]+", " ", stem).strip()
-        return fallback or stem
-
-    title = " ".join(title_tokens).strip()
-    if year_token:
-        return f"{title} ({year_token})"
-    return title
-
-def normalize_series_title_for_prompt(series_title):
-    if not series_title:
+def normalize_series_title_for_prompt(series_context=None, fallback_title=""):
+    title_hint = canonical_series_title(series_context, fallback_title=fallback_title)
+    if not title_hint:
         return ""
-    return re.sub(r"\s*\((19|20)\d{2}\)\s*$", "", str(series_title)).strip()
+    return re.sub(r"\s*\((19|20)\d{2}\)\s*$", "", str(title_hint)).strip()
 
-def build_asr_initial_prompt(series_title=None):
-    title_hint = normalize_series_title_for_prompt(series_title)
+def build_asr_initial_prompt(series_context=None, fallback_title=""):
+    title_hint = normalize_series_title_for_prompt(series_context=series_context, fallback_title=fallback_title)
     if not title_hint:
         return DEFAULT_ASR_INITIAL_PROMPT
     return f"こんにちは。{title_hint}。Hello。今日はいい天気ですね。"
 
-def build_asr_hotwords(series_title=None):
-    title_hint = normalize_series_title_for_prompt(series_title)
-    if not title_hint:
+def build_asr_hotwords(series_context=None, fallback_title=""):
+    hotwords = build_asr_hotword_list(series_context, fallback_title=fallback_title)
+    if not hotwords:
         return None
-
-    candidates = [title_hint]
-    condensed = re.sub(r"\s+", "", title_hint)
-    if condensed and condensed.casefold() != title_hint.casefold():
-        candidates.append(condensed)
-
-    unique_candidates = []
-    seen = set()
-    for candidate in candidates:
-        normalized_candidate = candidate.strip()
-        key = normalized_candidate.casefold()
-        if normalized_candidate and key not in seen:
-            seen.add(key)
-            unique_candidates.append(normalized_candidate)
-
-    if not unique_candidates:
-        return None
-    return ", ".join(unique_candidates)
+    return ", ".join(hotwords)
 
 def find_cached_raw_vocals(base_name, separator_model):
     search_pattern = os.path.join(
@@ -240,17 +211,23 @@ def normalize_cached_asr_model(cached_meta):
         return "kotoba-whisper-v1.1"
     return "large-v3"
 
-def transcription_settings_match(cached_meta, asr_source, asr_model, separator_model, series_title):
+def transcription_settings_match(cached_meta, asr_source, asr_model, separator_model, series_title, pipeline_mode, judge_model, context_hash):
     cached_source = cached_meta.get("transcription_source", LEGACY_ASR_SOURCE)
     cached_model = normalize_cached_asr_model(cached_meta)
     cached_separator = cached_meta.get("separator_model", DEFAULT_SEPARATOR_MODEL)
     cached_prompt_version = cached_meta.get("transcription_prompt_version", 0)
     cached_series_title = cached_meta.get("transcription_series_title")
+    cached_pipeline_mode = cached_meta.get("pipeline_mode", CURRENT_PIPELINE_MODE)
+    cached_judge_model = cached_meta.get("transcription_judge_model", DEFAULT_JUDGE_MODEL)
+    cached_context_hash = cached_meta.get("series_context_hash")
 
     if cached_source != asr_source or cached_model != asr_model:
         return False
 
     if cached_prompt_version != TRANSCRIPTION_PROMPT_VERSION or cached_series_title != series_title:
+        return False
+
+    if cached_pipeline_mode != pipeline_mode or cached_judge_model != judge_model or cached_context_hash != context_hash:
         return False
 
     if asr_source == "mix":
@@ -513,6 +490,10 @@ def collect_hybrid_rescue_windows(base_subtitles, duration):
                 "reasons": {"gap"},
             })
 
+    return merge_rescue_windows(rescue_windows)
+
+
+def merge_rescue_windows(rescue_windows):
     rescue_windows.sort(key=lambda item: (item["window_start"], item["window_end"]))
     merged_windows = []
     for window in rescue_windows:
@@ -539,6 +520,96 @@ def collect_hybrid_rescue_windows(base_subtitles, duration):
         window["reasons"] = sorted(window["reasons"])
 
     return merged_windows
+
+
+def get_artifact_dir(dir_name, base_name):
+    artifact_dir = os.path.join(dir_name, f"{base_name}_artifacts")
+    os.makedirs(artifact_dir, exist_ok=True)
+    return artifact_dir
+
+
+def save_json_artifact(path, payload):
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2)
+
+
+def subtitles_to_segments(subtitles):
+    return normalize_raw_segments(
+        {
+            "start": subtitle["start"],
+            "end": subtitle["end"],
+            "text": subtitle["text_jp"],
+        }
+        for subtitle in subtitles
+    )
+
+
+def segments_text(raw_segments):
+    return "".join(segment["text"] for segment in raw_segments)
+
+
+def segments_materially_different(left_segments, right_segments):
+    return normalize_alignment_text(segments_text(left_segments)) != normalize_alignment_text(segments_text(right_segments))
+
+
+def ranges_overlap(start_a, end_a, start_b, end_b, padding=0.0):
+    return max(start_a, start_b) <= min(end_a, end_b) + padding
+
+
+def collect_source_disagreement_windows(base_subtitles, alternative_subtitles, duration):
+    rescue_windows = []
+
+    for alt_subtitle in alternative_subtitles:
+        overlapping = [
+            base_subtitle
+            for base_subtitle in base_subtitles
+            if ranges_overlap(
+                base_subtitle["start"],
+                base_subtitle["end"],
+                alt_subtitle["start"],
+                alt_subtitle["end"],
+                padding=PROFILE_REVIEW_CONTEXT,
+            )
+        ]
+
+        if not overlapping:
+            rescue_windows.append(
+                {
+                    "window_start": max(0.0, alt_subtitle["start"] - PROFILE_REVIEW_CONTEXT),
+                    "window_end": min(duration, alt_subtitle["end"] + PROFILE_REVIEW_CONTEXT),
+                    "target_start": alt_subtitle["start"],
+                    "target_end": alt_subtitle["end"],
+                    "reasons": {"raw_only"},
+                }
+            )
+            continue
+
+        base_segments = subtitles_to_segments(overlapping)
+        alt_segments = subtitles_to_segments([alt_subtitle])
+        if not segments_materially_different(base_segments, alt_segments):
+            continue
+
+        target_start = min(overlap["start"] for overlap in overlapping + [alt_subtitle])
+        target_end = max(overlap["end"] for overlap in overlapping + [alt_subtitle])
+        rescue_windows.append(
+            {
+                "window_start": max(0.0, target_start - PROFILE_REVIEW_CONTEXT),
+                "window_end": min(duration, target_end + PROFILE_REVIEW_CONTEXT),
+                "target_start": target_start,
+                "target_end": target_end,
+                "reasons": {"source_disagreement"},
+            }
+        )
+
+    return merge_rescue_windows(rescue_windows)
+
+
+def collect_profile_rescue_windows(base_subtitles, alternative_subtitles, duration, pipeline_mode=CURRENT_PIPELINE_MODE):
+    windows = collect_hybrid_rescue_windows(base_subtitles, duration)
+    windows.extend(collect_source_disagreement_windows(base_subtitles, alternative_subtitles, duration))
+    if mode_uses_maximum_jp_review(pipeline_mode):
+        windows.extend(collect_hybrid_rescue_windows(alternative_subtitles, duration))
+    return merge_rescue_windows(windows)
 
 def extract_segments_for_target(raw_segments, start, end):
     return [
@@ -589,7 +660,7 @@ def should_accept_hybrid_candidate(base_segments, candidate_segments, reasons):
     if any((segment["end"] - segment["start"]) > HYBRID_MAX_CANDIDATE_SEGMENT_DURATION for segment in candidate_segments):
         return False
 
-    if "gap" in reasons and not base_segments:
+    if {"gap", "raw_only", "source_disagreement"} & set(reasons) and not base_segments:
         return candidate_score >= HYBRID_MIN_CANDIDATE_JAPANESE_CHARS
 
     base_text = "".join(segment["text"] for segment in base_segments)
@@ -614,13 +685,23 @@ def should_accept_hybrid_candidate(base_segments, candidate_segments, reasons):
 
     return False
 
-def transcribe_with_hybrid(alignment_model, transcription_audio_path, transcription_duration, alignment_audio_path, alignment_duration, romanizer, series_title=None):
+def transcribe_with_hybrid(
+    alignment_model,
+    transcription_audio_path,
+    transcription_duration,
+    alignment_audio_path,
+    alignment_duration,
+    romanizer,
+    series_context=None,
+    fallback_title="",
+):
     print("5% Running faster-whisper baseline...", file=sys.stderr)
     base_segments, info = transcribe_with_faster_whisper(
         alignment_model,
         transcription_audio_path,
         transcription_duration,
-        series_title=series_title,
+        series_context=series_context,
+        fallback_title=fallback_title,
     )
 
     print("45% Refining baseline timings for hybrid comparison...", file=sys.stderr)
@@ -700,6 +781,266 @@ def transcribe_with_hybrid(alignment_model, transcription_audio_path, transcript
     return merged_subtitles, merged_segments, info, {
         "windows_total": len(rescue_windows),
         "windows_accepted": accepted_windows,
+    }
+
+
+def score_candidate_segments(candidate_segments, series_context=None, fallback_title=""):
+    candidate_text = segments_text(candidate_segments)
+    if not candidate_text:
+        return -999
+    score = text_quality_score(candidate_text)
+    for hotword in build_asr_hotword_list(series_context, fallback_title=fallback_title):
+        if hotword and hotword in candidate_text:
+            score += 2
+    return score
+
+
+def judge_profile_candidate_choice(
+    window,
+    candidates,
+    judge_model,
+    series_context=None,
+    fallback_title="",
+    previous_context=None,
+    next_context=None,
+):
+    candidate_payload = {
+        label: {
+            "text": segments_text(segments),
+            "segments": segments,
+        }
+        for label, segments in candidates.items()
+    }
+    prompt = (
+        "You are choosing the best Japanese subtitle candidate for one anime dialogue window.\n"
+        "Rules:\n"
+        "- Choose the candidate that most likely matches the spoken Japanese.\n"
+        "- Prefer known series terminology only when the candidate text supports it.\n"
+        "- Do not invent a new transcript.\n"
+        "- Reply ONLY JSON like {\"choice\":\"mix\"}.\n\n"
+        f"SERIES TITLE: {canonical_series_title(series_context, fallback_title=fallback_title)}\n"
+        f"KNOWN HOTWORDS: {', '.join(build_asr_hotword_list(series_context, fallback_title=fallback_title)) or '(none)'}\n"
+        f"PREVIOUS JP CONTEXT: {' | '.join(previous_context or []) or '(none)'}\n"
+        f"NEXT JP CONTEXT: {' | '.join(next_context or []) or '(none)'}\n"
+        f"WINDOW REASONS: {', '.join(window['reasons'])}\n"
+        f"CANDIDATES:\n{json.dumps(candidate_payload, ensure_ascii=False, indent=2)}"
+    )
+    raw_response = call_ollama_model(
+        judge_model,
+        prompt,
+        system_prompt="Return only valid JSON. Choose one candidate key from the provided candidates.",
+        options={"temperature": 0.0},
+        timeout=600,
+    )
+    match = re.search(r"\{.*\}", raw_response or "", re.DOTALL)
+    if not match:
+        return None
+    try:
+        parsed = json.loads(match.group(0))
+    except json.JSONDecodeError:
+        return None
+    choice = str(parsed.get("choice", "")).strip().lower()
+    if choice not in candidates:
+        return None
+    return choice
+
+
+def select_profile_candidate(
+    window,
+    base_segments,
+    raw_segments,
+    kotoba_segments,
+    judge_model,
+    pipeline_mode,
+    series_context=None,
+    fallback_title="",
+    previous_context=None,
+    next_context=None,
+):
+    candidates = {"mix": base_segments}
+    if raw_segments and should_accept_hybrid_candidate(base_segments, raw_segments, window["reasons"]):
+        candidates["raw"] = raw_segments
+    if kotoba_segments and should_accept_hybrid_candidate(base_segments, kotoba_segments, window["reasons"]):
+        candidates["kotoba"] = kotoba_segments
+
+    if len(candidates) == 1:
+        return "mix", candidates
+
+    heuristic_choice = max(
+        candidates,
+        key=lambda label: score_candidate_segments(
+            candidates[label],
+            series_context=series_context,
+            fallback_title=fallback_title,
+        ),
+    )
+
+    if mode_uses_jp_judging(pipeline_mode) and judge_model:
+        try:
+            judged_choice = judge_profile_candidate_choice(
+                window,
+                candidates,
+                judge_model,
+                series_context=series_context,
+                fallback_title=fallback_title,
+                previous_context=previous_context,
+                next_context=next_context,
+            )
+            if judged_choice:
+                return judged_choice, candidates
+        except Exception as exc:
+            tqdm.write(f"\n[!] JP judge fallback: {exc}")
+
+    return heuristic_choice, candidates
+
+
+def transcribe_with_profile(
+    alignment_model,
+    raw_vocals_path,
+    alignment_audio_path,
+    alignment_duration,
+    romanizer,
+    pipeline_mode,
+    judge_model,
+    series_context=None,
+    fallback_title="",
+    artifact_dir=None,
+):
+    emit_status("transcribing_mix")
+    mix_raw_segments, info = transcribe_with_faster_whisper(
+        alignment_model,
+        alignment_audio_path,
+        alignment_duration,
+        series_context=series_context,
+        fallback_title=fallback_title,
+    )
+    mix_subtitles = build_subtitles_from_raw_segments(mix_raw_segments, romanizer)
+    mix_subtitles = refine_subtitle_timings(alignment_model, alignment_audio_path, mix_subtitles, alignment_duration)
+    mix_segments = subtitles_to_segments(mix_subtitles)
+
+    emit_status("transcribing_raw_vocals")
+    raw_raw_segments, _raw_info = transcribe_with_faster_whisper(
+        alignment_model,
+        raw_vocals_path,
+        get_audio_duration(raw_vocals_path) or alignment_duration,
+        series_context=series_context,
+        fallback_title=fallback_title,
+    )
+    raw_subtitles = build_subtitles_from_raw_segments(raw_raw_segments, romanizer)
+    raw_subtitles = refine_subtitle_timings(alignment_model, alignment_audio_path, raw_subtitles, alignment_duration)
+    raw_segments = subtitles_to_segments(raw_subtitles)
+
+    if artifact_dir:
+        save_json_artifact(os.path.join(artifact_dir, "jp_mix_debug.json"), mix_raw_segments)
+        save_json_artifact(os.path.join(artifact_dir, "jp_mix_refined.json"), mix_subtitles)
+        save_json_artifact(os.path.join(artifact_dir, "jp_raw_vocals_debug.json"), raw_raw_segments)
+        save_json_artifact(os.path.join(artifact_dir, "jp_raw_vocals_refined.json"), raw_subtitles)
+
+    rescue_windows = collect_profile_rescue_windows(
+        mix_subtitles,
+        raw_subtitles,
+        alignment_duration,
+        pipeline_mode=pipeline_mode,
+    )
+    merged_segments = list(mix_segments)
+    decisions = []
+    accepted_windows = 0
+
+    if not rescue_windows:
+        return mix_subtitles, merged_segments, info, {"windows_total": 0, "windows_accepted": 0, "decisions": []}
+
+    emit_status("judging_transcript", windows=len(rescue_windows))
+    for window in rescue_windows:
+        base_target_segments = clamp_segments_to_target(
+            extract_segments_for_target(merged_segments, window["target_start"], window["target_end"]),
+            window["target_start"],
+            window["target_end"],
+        )
+        raw_target_segments = clamp_segments_to_target(
+            extract_segments_for_target(raw_segments, window["target_start"], window["target_end"]),
+            window["target_start"],
+            window["target_end"],
+        )
+
+        kotoba_target_segments = []
+        clip_audio, clip_sample_rate = read_wav_clip_with_sample_rate(
+            raw_vocals_path,
+            window["window_start"],
+            window["window_end"],
+        )
+        if clip_audio.size != 0:
+            kotoba_candidate_segments, _ = transcribe_with_kotoba(
+                (clip_audio, clip_sample_rate),
+                window["window_end"] - window["window_start"],
+                announce=False,
+            )
+            kotoba_target_segments = normalize_raw_segments(
+                {
+                    "start": segment["start"] + window["window_start"],
+                    "end": segment["end"] + window["window_start"],
+                    "text": segment["text"],
+                }
+                for segment in kotoba_candidate_segments
+            )
+            kotoba_target_segments = clamp_segments_to_target(
+                extract_segments_for_target(kotoba_target_segments, window["target_start"], window["target_end"]),
+                window["target_start"],
+                window["target_end"],
+            )
+
+        target_start = window["target_start"]
+        target_end = window["target_end"]
+        previous_context = [
+            subtitle["text_jp"]
+            for subtitle in mix_subtitles
+            if subtitle["end"] <= target_start
+        ][-2:]
+        next_context = [
+            subtitle["text_jp"]
+            for subtitle in mix_subtitles
+            if subtitle["start"] >= target_end
+        ][:2]
+
+        choice, candidate_map = select_profile_candidate(
+            window,
+            base_target_segments,
+            raw_target_segments,
+            kotoba_target_segments,
+            judge_model,
+            pipeline_mode,
+            series_context=series_context,
+            fallback_title=fallback_title,
+            previous_context=previous_context,
+            next_context=next_context,
+        )
+
+        decisions.append(
+            {
+                "window": window,
+                "choice": choice,
+                "candidates": {label: segments_text(segments) for label, segments in candidate_map.items()},
+            }
+        )
+        if choice == "mix":
+            continue
+
+        merged_segments = [
+            segment for segment in merged_segments
+            if not (target_start <= segment_midpoint(segment) <= target_end)
+        ]
+        merged_segments.extend(candidate_map[choice])
+        merged_segments = normalize_raw_segments(merged_segments)
+        accepted_windows += 1
+
+    merged_segments = prune_redundant_segments(merged_segments)
+    if artifact_dir:
+        save_json_artifact(os.path.join(artifact_dir, "jp_resolution_windows.json"), decisions)
+        save_json_artifact(os.path.join(artifact_dir, "jp_resolved_segments.json"), merged_segments)
+    merged_subtitles = build_subtitles_from_raw_segments(merged_segments, romanizer)
+    return merged_subtitles, merged_segments, info, {
+        "windows_total": len(rescue_windows),
+        "windows_accepted": accepted_windows,
+        "decisions": decisions,
     }
 
 def rescue_suspicious_timings(audio_path, source_subtitles, refined_subtitles, duration):
@@ -806,8 +1147,8 @@ def refine_subtitle_timings(model, audio_path, subtitles, duration):
 
     return rescue_suspicious_timings(audio_path, subtitles, refined_subtitles, duration)
 
-def transcribe_with_faster_whisper(model, audio_path, duration, series_title=None):
-    hotwords = build_asr_hotwords(series_title)
+def transcribe_with_faster_whisper(model, audio_path, duration, series_context=None, fallback_title=""):
+    hotwords = build_asr_hotwords(series_context=series_context, fallback_title=fallback_title)
     transcription_result = model.transcribe(
         audio_path,
 
@@ -839,7 +1180,7 @@ def transcribe_with_faster_whisper(model, audio_path, duration, series_title=Non
         # Default: None
         # Description: A string of text fed to the AI before it starts transcribing.
         # Reasoning: Subliminally forces the AI to use proper Japanese punctuation (。、) and permits it to output English characters (Hello) for loan words.
-        initial_prompt=build_asr_initial_prompt(series_title),
+        initial_prompt=build_asr_initial_prompt(series_context=series_context, fallback_title=fallback_title),
 
         # hotwords
         # Default: None
@@ -984,7 +1325,16 @@ def transcribe_with_kotoba(audio_input, duration, announce=True):
         print("85% Finalizing Kotoba transcript...", file=sys.stderr)
     return raw_segments, {"language": "ja", "language_probability": None}
 
-def main(input_file, asr_source=DEFAULT_ASR_SOURCE, asr_model=DEFAULT_ASR_MODEL, separator_model=DEFAULT_SEPARATOR_MODEL):
+def main(
+    input_file,
+    asr_source=DEFAULT_ASR_SOURCE,
+    asr_model=DEFAULT_ASR_MODEL,
+    separator_model=DEFAULT_SEPARATOR_MODEL,
+    pipeline_mode=CURRENT_PIPELINE_MODE,
+    series_context_path=None,
+    context_model=DEFAULT_CONTEXT_MODEL,
+    judge_model=DEFAULT_JUDGE_MODEL,
+):
     start_time = time.time()
 
     if not os.path.exists(input_file):
@@ -994,6 +1344,7 @@ def main(input_file, asr_source=DEFAULT_ASR_SOURCE, asr_model=DEFAULT_ASR_MODEL,
     base_name = os.path.splitext(os.path.basename(input_file))[0]
     dir_name = os.path.dirname(input_file)
     series_title = infer_series_title(input_file)
+    artifact_dir = get_artifact_dir(dir_name, base_name)
     output_json_path = os.path.join(dir_name, f"{base_name}.json")
     output_srt_romaji = os.path.join(dir_name, f"{base_name}.romaji.srt")
     output_srt_kanji = os.path.join(dir_name, f"{base_name}.kanji.srt")
@@ -1005,6 +1356,32 @@ def main(input_file, asr_source=DEFAULT_ASR_SOURCE, asr_model=DEFAULT_ASR_MODEL,
     hybrid_stats = None
     romanizer = kakasi()
     selected_separator_model = normalize_separator_model_name(separator_model)
+    effective_asr_source = asr_source if pipeline_mode == CURRENT_PIPELINE_MODE else "mix"
+    effective_asr_model = asr_model if pipeline_mode == CURRENT_PIPELINE_MODE else "large-v3"
+
+    emit_status("loading_series_context", file=input_file)
+    try:
+        series_context, series_context_source, series_context_cache_path = resolve_series_context(
+            input_file,
+            override_path=series_context_path,
+            allow_fetch=mode_uses_context_fetch(pipeline_mode),
+            enrich_model=context_model,
+        )
+    except Exception as exc:
+        tqdm.write(f"\n[!] Series context fetch failed: {exc}")
+        series_context, series_context_source, series_context_cache_path = resolve_series_context(
+            input_file,
+            override_path=series_context_path,
+            allow_fetch=False,
+        )
+    context_hash = series_context_hash(series_context, fallback_title=series_title)
+    save_json_artifact(os.path.join(artifact_dir, "series_context.runtime.json"), series_context)
+    emit_status(
+        "loaded_series_context",
+        source=series_context_source,
+        cache_path=series_context_cache_path,
+        title=canonical_series_title(series_context, fallback_title=series_title),
+    )
 
     if os.path.exists(output_json_path):
         with open(output_json_path, "r", encoding="utf-8") as f:
@@ -1013,15 +1390,18 @@ def main(input_file, asr_source=DEFAULT_ASR_SOURCE, asr_model=DEFAULT_ASR_MODEL,
         cached_meta = cached_data.get("meta", {})
         config_matches = transcription_settings_match(
             cached_meta,
-            asr_source,
-            asr_model,
+            effective_asr_source,
+            effective_asr_model,
             selected_separator_model,
             series_title,
+            pipeline_mode,
+            judge_model,
+            context_hash,
         )
 
         if not config_matches:
             print(
-                "\n[!] CACHE INVALIDATED: Transcription source, ASR model, or separator model changed. Regenerating transcript.\n",
+                "\n[!] CACHE INVALIDATED: Transcription settings, profile, judge model, or series context changed. Regenerating transcript.\n",
                 file=sys.stderr,
             )
             cached_data = None
@@ -1079,7 +1459,7 @@ def main(input_file, asr_source=DEFAULT_ASR_SOURCE, asr_model=DEFAULT_ASR_MODEL,
     source_duration = get_audio_duration(raw_vocals_path)
 
     # 2. NORMALIZE AUDIO (legacy / optional source)
-    if asr_source == "normalized_vocals" and not os.path.exists(normalized_vocals_path):
+    if pipeline_mode == CURRENT_PIPELINE_MODE and effective_asr_source == "normalized_vocals" and not os.path.exists(normalized_vocals_path):
         normalize_audio(raw_vocals_path, normalized_vocals_path, source_duration)
 
     alignment_audio_path = os.path.join(TEMP_DIR, f"alignment_{base_name}.wav")
@@ -1087,7 +1467,7 @@ def main(input_file, asr_source=DEFAULT_ASR_SOURCE, asr_model=DEFAULT_ASR_MODEL,
         extract_alignment_audio(input_file, alignment_audio_path)
     alignment_duration = get_audio_duration(alignment_audio_path)
     transcription_audio_path = select_transcription_audio_path(
-        asr_source,
+        effective_asr_source,
         raw_vocals_path,
         normalized_vocals_path,
         alignment_audio_path,
@@ -1110,33 +1490,49 @@ def main(input_file, asr_source=DEFAULT_ASR_SOURCE, asr_model=DEFAULT_ASR_MODEL,
     if results is None:
         # 3. TRANSCRIBE
         print(json.dumps({"status": "transcribing"}), file=sys.stderr)
-        if asr_model == "large-v3":
-            raw_segments_debug, info = transcribe_with_faster_whisper(
+        if pipeline_mode == CURRENT_PIPELINE_MODE:
+            if effective_asr_model == "large-v3":
+                raw_segments_debug, info = transcribe_with_faster_whisper(
+                    alignment_model,
+                    transcription_audio_path,
+                    transcription_duration,
+                    series_context=series_context,
+                    fallback_title=series_title,
+                )
+            elif effective_asr_model == "kotoba-whisper-v1.1":
+                raw_segments_debug, info = transcribe_with_kotoba(
+                    transcription_audio_path,
+                    transcription_duration,
+                )
+            elif effective_asr_model == "hybrid":
+                results, raw_segments_debug, info, hybrid_stats = transcribe_with_hybrid(
+                    alignment_model,
+                    transcription_audio_path,
+                    transcription_duration,
+                    alignment_audio_path,
+                    alignment_duration,
+                    romanizer,
+                    series_context=series_context,
+                    fallback_title=series_title,
+                )
+            else:
+                raise ValueError(f"Unsupported ASR model: {effective_asr_model}")
+
+            if effective_asr_model != "hybrid":
+                results = build_subtitles_from_raw_segments(raw_segments_debug, romanizer)
+        else:
+            results, raw_segments_debug, info, hybrid_stats = transcribe_with_profile(
                 alignment_model,
-                transcription_audio_path,
-                transcription_duration,
-                series_title=series_title,
-            )
-        elif asr_model == "kotoba-whisper-v1.1":
-            raw_segments_debug, info = transcribe_with_kotoba(
-                transcription_audio_path,
-                transcription_duration,
-            )
-        elif asr_model == "hybrid":
-            results, raw_segments_debug, info, hybrid_stats = transcribe_with_hybrid(
-                alignment_model,
-                transcription_audio_path,
-                transcription_duration,
+                raw_vocals_path,
                 alignment_audio_path,
                 alignment_duration,
                 romanizer,
-                series_title=series_title,
+                pipeline_mode,
+                judge_model,
+                series_context=series_context,
+                fallback_title=series_title,
+                artifact_dir=artifact_dir,
             )
-        else:
-            raise ValueError(f"Unsupported ASR model: {asr_model}")
-
-        if asr_model != "hybrid":
-            results = build_subtitles_from_raw_segments(raw_segments_debug, romanizer)
 
         print(json.dumps({"status": "saving_debug", "file": debug_json_path}), file=sys.stderr)
         with open(debug_json_path, "w", encoding="utf-8") as f:
@@ -1147,7 +1543,7 @@ def main(input_file, asr_source=DEFAULT_ASR_SOURCE, asr_model=DEFAULT_ASR_MODEL,
     total_time = time.time() - start_time
     output_meta = dict(cached_meta)
     output_meta["processing_time"] = round(total_time, 2)
-    output_meta["model"] = f"{asr_model}-transcribe+{DEFAULT_ALIGNMENT_MODEL}-align+mms-rescue"
+    output_meta["model"] = f"{effective_asr_model}-transcribe+{DEFAULT_ALIGNMENT_MODEL}-align+mms-rescue"
     output_meta["timing_refined"] = True
     output_meta["timing_refiner"] = "stable-ts-align_words+mms-forced-align-rescue"
     output_meta["timing_refinement_version"] = TIMING_REFINEMENT_VERSION
@@ -1157,21 +1553,32 @@ def main(input_file, asr_source=DEFAULT_ASR_SOURCE, asr_model=DEFAULT_ASR_MODEL,
     output_meta["whisper_compute_type"] = whisper_compute_type
     output_meta["romaji_version"] = ROMAJI_VERSION
     output_meta["romaji_converter"] = "pykakasi-hepburn"
-    output_meta["transcription_model"] = asr_model
+    output_meta["transcription_model"] = effective_asr_model
     output_meta["transcription_series_title"] = series_title
     output_meta["transcription_prompt_version"] = TRANSCRIPTION_PROMPT_VERSION
-    output_meta["transcription_hotwords"] = build_asr_hotwords(series_title)
-    if asr_model == "large-v3":
+    output_meta["transcription_hotwords"] = build_asr_hotwords(series_context=series_context, fallback_title=series_title)
+    output_meta["pipeline_mode"] = pipeline_mode
+    output_meta["transcription_judge_model"] = judge_model
+    output_meta["series_context_hash"] = context_hash
+    output_meta["series_context_source"] = series_context_source
+    output_meta["series_context_model"] = context_model
+    if effective_asr_model == "large-v3" and pipeline_mode == CURRENT_PIPELINE_MODE:
         output_meta["transcription_backend"] = "faster-whisper"
-    elif asr_model == "hybrid":
+    elif effective_asr_model == "hybrid":
         output_meta["transcription_backend"] = "hybrid(faster-whisper+kotoba)"
+    elif pipeline_mode != CURRENT_PIPELINE_MODE:
+        output_meta["transcription_backend"] = f"profile({pipeline_mode}: faster-whisper[mix+raw_vocals]+kotoba+judge)"
     else:
         output_meta["transcription_backend"] = "transformers"
-    output_meta["transcription_source"] = asr_source
+    output_meta["transcription_source"] = effective_asr_source
     output_meta["separator_model"] = selected_separator_model
+    if pipeline_mode != CURRENT_PIPELINE_MODE:
+        output_meta["transcription_profile_sources"] = ["mix", "raw_vocals"]
     if hybrid_stats:
         output_meta["hybrid_rescue_windows"] = hybrid_stats.get("windows_total", 0)
         output_meta["hybrid_rescue_accepted"] = hybrid_stats.get("windows_accepted", 0)
+        if "decisions" in hybrid_stats:
+            save_json_artifact(os.path.join(artifact_dir, "jp_resolution_summary.json"), hybrid_stats)
     if info:
         output_meta["language"] = info.get("language", "ja")
         if info.get("language_probability") is not None:
@@ -1197,21 +1604,42 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Separate vocals, transcribe Japanese audio, and refine subtitle timings.")
     parser.add_argument("video_file", help="Path to the input video file.")
     parser.add_argument(
+        "--pipeline-mode",
+        choices=SUPPORTED_PIPELINE_MODES,
+        default=CURRENT_PIPELINE_MODE,
+        help="Pipeline profile to run: current, balanced, or max.",
+    )
+    parser.add_argument(
         "--asr-source",
         choices=SUPPORTED_ASR_SOURCES,
         default=DEFAULT_ASR_SOURCE,
-        help="Audio source used for transcription. 'mix' is the current recommended default.",
+        help="Audio source used for transcription. Only the current profile uses this directly; balanced/max always run dual-source review.",
     )
     parser.add_argument(
         "--asr-model",
         choices=SUPPORTED_ASR_MODELS,
         default=DEFAULT_ASR_MODEL,
-        help="ASR model used for transcription. 'large-v3' is the stable default; 'hybrid' runs Whisper first and then lets Kotoba rescue suspicious windows.",
+        help="ASR model used for transcription. Only the current profile uses this directly; balanced/max run a profile resolver built on large-v3, raw-vocals review, and targeted rescue.",
     )
     parser.add_argument(
         "--separator-model",
         default=DEFAULT_SEPARATOR_MODEL,
         help="Separator checkpoint filename to use when generating the vocals stem.",
+    )
+    parser.add_argument(
+        "--series-context",
+        default="",
+        help="Optional path to a local series_context.json override file.",
+    )
+    parser.add_argument(
+        "--context-model",
+        default=DEFAULT_CONTEXT_MODEL,
+        help="Ollama model used to enrich missing global series context when needed.",
+    )
+    parser.add_argument(
+        "--judge-model",
+        default=DEFAULT_JUDGE_MODEL,
+        help="Ollama model used for transcript-window judging in balanced/max modes.",
     )
     return parser.parse_args()
 
@@ -1222,4 +1650,8 @@ if __name__ == "__main__":
         asr_source=args.asr_source,
         asr_model=args.asr_model,
         separator_model=args.separator_model,
+        pipeline_mode=args.pipeline_mode,
+        series_context_path=args.series_context or None,
+        context_model=args.context_model,
+        judge_model=args.judge_model,
     )

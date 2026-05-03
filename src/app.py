@@ -8,6 +8,16 @@ import json
 import customtkinter as ctk
 from tkinter import filedialog, messagebox
 
+from pipeline_profiles import (
+    BALANCED_PIPELINE_MODE,
+    CURRENT_PIPELINE_MODE,
+    DEFAULT_CONTEXT_MODEL,
+    DEFAULT_JUDGE_MODEL,
+    DEFAULT_PRIMARY_TRANSLATION_MODEL,
+    DEFAULT_SECONDARY_TRANSLATION_MODEL,
+    MAX_PIPELINE_MODE,
+)
+
 # --- CONFIGURATION ---
 ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("blue")
@@ -22,27 +32,72 @@ ASR_MODEL_OPTIONS = {
     "Hybrid (Experimental: Whisper + Kotoba)": "hybrid",
     "Kotoba-Whisper v1.1 (Advanced)": "kotoba-whisper-v1.1",
 }
+PIPELINE_MODE_OPTIONS = {
+    "Current (Fast / Compatible)": CURRENT_PIPELINE_MODE,
+    "Balanced (Recommended)": BALANCED_PIPELINE_MODE,
+    "Max Accuracy (Slowest)": MAX_PIPELINE_MODE,
+}
 DEFAULT_SEPARATOR_MODEL = "model_bs_roformer_ep_317_sdr_12.9755.ckpt"
-DEFAULT_TRANSLATION_MODEL = "qwen3:14b"
+DEFAULT_TRANSLATION_MODEL = DEFAULT_PRIMARY_TRANSLATION_MODEL
 SEPARATOR_MODEL_OPTIONS = {
     "BS-RoFormer (Default)": DEFAULT_SEPARATOR_MODEL,
 }
 TRANSLATION_MODEL_OPTIONS = {
     "Qwen3 14B (Default)": "qwen3:14b",
+    "Qwen3.5 9B": "qwen3.5:9b",
     "TranslateGemma 12B": "translategemma:12b",
+}
+JUDGE_MODEL_OPTIONS = {
+    "Qwen3.5 9B (Default)": DEFAULT_JUDGE_MODEL,
+    "Qwen3 14B": "qwen3:14b",
+}
+CONTEXT_MODEL_OPTIONS = {
+    "Qwen3.5 9B (Default)": DEFAULT_CONTEXT_MODEL,
+    "Qwen3 14B": "qwen3:14b",
+}
+SECONDARY_TRANSLATION_MODEL_OPTIONS = {
+    "TranslateGemma 12B (Default Secondary)": DEFAULT_SECONDARY_TRANSLATION_MODEL,
+    "Qwen3.5 9B": "qwen3.5:9b",
+    "Qwen3 14B": "qwen3:14b",
 }
 SCRIPT_STATUS_LABELS = {
     "process_audio.py": {
+        "loading_series_context": "Loading series context",
+        "loaded_series_context": "Series context ready",
         "extracting_alignment_audio": "Extracting alignment audio",
         "normalizing_audio": "Normalizing vocals audio",
         "separating_vocals": "Separating vocals stem",
         "skipping_separation": "Reusing cached vocals stem",
         "transcribing": "Transcribing Japanese audio",
+        "transcribing_mix": "Transcribing mixed track",
+        "transcribing_raw_vocals": "Transcribing raw vocals stem",
+        "judging_transcript": "Resolving JP disagreement windows",
         "refining_timestamps": "Refining subtitle timings",
         "saving_debug": "Saving raw transcript debug output",
         "saved_to_disk": "Writing subtitle files to disk",
         "done": "Japanese transcription stage finished",
-    }
+    },
+    "translate_subs.py": {
+        "loading_series_context": "Loading series context",
+        "loaded_series_context": "Series context ready",
+        "translating_primary": "Generating primary English translation",
+        "reviewing_translations": "Reviewing flagged English lines",
+        "normalizing_translation_terms": "Normalizing title and glossary terms",
+        "exporting_subtitles": "Writing translated subtitle files",
+        "done": "Translation stage finished",
+    },
+    "series_context_tool.py": {
+        "resolving_series_context": "Fetching series metadata",
+        "saved_series_context": "Saved global series cache entry",
+        "saved_local_series_context": "Saved local series context file",
+    },
+    "check_settings.py": {
+        "checking_environment": "Checking Python, FFmpeg, and GPU runtime",
+        "checking_ollama": "Checking Ollama model availability",
+        "checking_separator_model": "Validating separator checkpoint",
+        "checking_series_context": "Validating series context override",
+        "done": "Settings validation finished",
+    },
 }
 
 class AnimePipelineApp(ctk.CTk):
@@ -50,7 +105,7 @@ class AnimePipelineApp(ctk.CTk):
         super().__init__()
 
         self.title("Anime AI Subtitler")
-        self.geometry("1040x900")
+        self.geometry("1480x900")
         
         # State variables
         self.selected_folder = ""
@@ -139,91 +194,211 @@ class AnimePipelineApp(ctk.CTk):
         # Buttons
         self.btn_frame = ctk.CTkFrame(self.progress_frame, fg_color="transparent")
         self.btn_frame.pack(pady=20)
+        self.btn_frame.grid_columnconfigure(0, weight=1)
+        self.btn_frame.grid_columnconfigure(1, weight=1)
+        self.btn_frame.grid_columnconfigure(2, weight=1)
 
         self.run_btn = ctk.CTkButton(self.btn_frame, text="Start Processing", command=self.start_pipeline, fg_color="green", hover_color="darkgreen")
-        self.run_btn.grid(row=0, column=0, padx=5)
+        self.run_btn.grid(row=0, column=0, padx=5, sticky="ew")
 
         self.cancel_curr_btn = ctk.CTkButton(self.btn_frame, text="Skip Current", command=self.cancel_current, state="disabled", fg_color="orange", hover_color="darkorange")
-        self.cancel_curr_btn.grid(row=0, column=1, padx=5)
+        self.cancel_curr_btn.grid(row=0, column=1, padx=5, sticky="ew")
 
         self.cancel_all_btn = ctk.CTkButton(self.btn_frame, text="Cancel All", command=self.cancel_all, state="disabled", fg_color="red", hover_color="darkred")
-        self.cancel_all_btn.grid(row=0, column=2, padx=5)
+        self.cancel_all_btn.grid(row=0, column=2, padx=5, sticky="ew")
+
+        self.tools_btn_frame = ctk.CTkFrame(self.btn_frame, fg_color="transparent")
+        self.tools_btn_frame.grid(row=1, column=0, columnspan=3, padx=5, pady=(10, 0), sticky="ew")
+        self.tools_btn_frame.grid_columnconfigure(0, weight=1)
+        self.tools_btn_frame.grid_columnconfigure(1, weight=1)
+
+        self.settings_check_btn = ctk.CTkButton(
+            self.tools_btn_frame,
+            text="Check Settings",
+            command=self.start_settings_check,
+            fg_color="slateblue",
+            hover_color="mediumpurple",
+        )
+        self.settings_check_btn.grid(row=0, column=0, padx=(0, 5), sticky="ew")
+
+        self.gpu_check_btn = ctk.CTkButton(
+            self.tools_btn_frame,
+            text="Check GPU",
+            command=self.start_gpu_check,
+            fg_color="steelblue",
+            hover_color="royalblue",
+        )
+        self.gpu_check_btn.grid(row=0, column=1, padx=(5, 0), sticky="ew")
 
         # Advanced settings
         self.advanced_frame = ctk.CTkFrame(self.progress_frame)
         self.advanced_frame.pack(pady=(0, 20), padx=20, fill="x")
-        self.advanced_frame.grid_columnconfigure(1, weight=1)
 
         self.advanced_lbl = ctk.CTkLabel(self.advanced_frame, text="Advanced Settings", font=("Arial", 14, "bold"))
-        self.advanced_lbl.grid(row=0, column=0, columnspan=2, sticky="w", padx=10, pady=(10, 6))
+        self.advanced_lbl.pack(anchor="w", padx=10, pady=(10, 6))
 
+        self.advanced_content = ctk.CTkFrame(self.advanced_frame, fg_color="transparent")
+        self.advanced_content.pack(fill="x", padx=10, pady=(0, 4))
+
+        self.advanced_left_frame = ctk.CTkFrame(self.advanced_content, fg_color="transparent")
+        self.advanced_left_frame.pack(side="left", fill="both", expand=True, padx=(0, 8))
+        self.advanced_left_frame.grid_columnconfigure(1, weight=1)
+        self.advanced_left_frame.grid_columnconfigure(2, weight=0)
+
+        self.advanced_right_frame = ctk.CTkFrame(self.advanced_content, fg_color="transparent")
+        self.advanced_right_frame.pack(side="left", fill="both", expand=True, padx=(8, 0))
+        self.advanced_right_frame.grid_columnconfigure(1, weight=1)
+
+        self.pipeline_mode_var = ctk.StringVar(value="Current (Fast / Compatible)")
         self.asr_source_var = ctk.StringVar(value="Original mix (Recommended)")
         self.asr_model_var = ctk.StringVar(value="Whisper large-v3 (Default)")
         self.separator_model_var = ctk.StringVar(value="BS-RoFormer (Default)")
         self.separator_model_custom_var = ctk.StringVar(value="")
         self.translation_model_var = ctk.StringVar(value="Qwen3 14B (Default)")
         self.translation_model_custom_var = ctk.StringVar(value="")
+        self.secondary_translation_model_var = ctk.StringVar(value="TranslateGemma 12B (Default Secondary)")
+        self.secondary_translation_model_custom_var = ctk.StringVar(value="")
+        self.judge_model_var = ctk.StringVar(value="Qwen3.5 9B (Default)")
+        self.judge_model_custom_var = ctk.StringVar(value="")
+        self.context_model_var = ctk.StringVar(value="Qwen3.5 9B (Default)")
+        self.context_model_custom_var = ctk.StringVar(value="")
+        self.series_context_path_var = ctk.StringVar(value="")
 
-        ctk.CTkLabel(self.advanced_frame, text="Transcription source").grid(row=1, column=0, sticky="w", padx=10, pady=4)
+        ctk.CTkLabel(self.advanced_left_frame, text="Processing profile").grid(row=0, column=0, sticky="w", padx=0, pady=4)
+        self.pipeline_mode_menu = ctk.CTkComboBox(
+            self.advanced_left_frame,
+            values=list(PIPELINE_MODE_OPTIONS.keys()),
+            variable=self.pipeline_mode_var,
+            state="readonly",
+        )
+        self.pipeline_mode_menu.grid(row=0, column=1, columnspan=2, sticky="ew", padx=0, pady=4)
+
+        ctk.CTkLabel(self.advanced_left_frame, text="Transcription source (Current mode)").grid(row=1, column=0, sticky="w", padx=0, pady=4)
         self.asr_source_menu = ctk.CTkComboBox(
-            self.advanced_frame,
+            self.advanced_left_frame,
             values=list(ASR_SOURCE_OPTIONS.keys()),
             variable=self.asr_source_var,
             state="readonly",
         )
-        self.asr_source_menu.grid(row=1, column=1, sticky="ew", padx=10, pady=4)
+        self.asr_source_menu.grid(row=1, column=1, columnspan=2, sticky="ew", padx=0, pady=4)
 
-        ctk.CTkLabel(self.advanced_frame, text="ASR model").grid(row=2, column=0, sticky="w", padx=10, pady=4)
+        ctk.CTkLabel(self.advanced_left_frame, text="ASR model (Current mode)").grid(row=2, column=0, sticky="w", padx=0, pady=4)
         self.asr_model_menu = ctk.CTkComboBox(
-            self.advanced_frame,
+            self.advanced_left_frame,
             values=list(ASR_MODEL_OPTIONS.keys()),
             variable=self.asr_model_var,
             state="readonly",
         )
-        self.asr_model_menu.grid(row=2, column=1, sticky="ew", padx=10, pady=4)
+        self.asr_model_menu.grid(row=2, column=1, columnspan=2, sticky="ew", padx=0, pady=4)
 
-        ctk.CTkLabel(self.advanced_frame, text="Separator model preset").grid(row=3, column=0, sticky="w", padx=10, pady=4)
+        ctk.CTkLabel(self.advanced_left_frame, text="Separator model preset").grid(row=3, column=0, sticky="w", padx=0, pady=4)
         self.separator_model_menu = ctk.CTkComboBox(
-            self.advanced_frame,
+            self.advanced_left_frame,
             values=list(SEPARATOR_MODEL_OPTIONS.keys()),
             variable=self.separator_model_var,
             state="readonly",
         )
-        self.separator_model_menu.grid(row=3, column=1, sticky="ew", padx=10, pady=4)
+        self.separator_model_menu.grid(row=3, column=1, columnspan=2, sticky="ew", padx=0, pady=4)
 
-        ctk.CTkLabel(self.advanced_frame, text="Custom separator model (Optional)").grid(row=4, column=0, sticky="w", padx=10, pady=4)
+        ctk.CTkLabel(self.advanced_left_frame, text="Custom separator model (Optional)").grid(row=4, column=0, sticky="w", padx=0, pady=4)
         self.separator_model_entry = ctk.CTkEntry(
-            self.advanced_frame,
+            self.advanced_left_frame,
             textvariable=self.separator_model_custom_var,
             placeholder_text="Override with another separator checkpoint filename",
         )
-        self.separator_model_entry.grid(row=4, column=1, sticky="ew", padx=10, pady=4)
+        self.separator_model_entry.grid(row=4, column=1, columnspan=2, sticky="ew", padx=0, pady=4)
 
-        ctk.CTkLabel(self.advanced_frame, text="Translation model preset").grid(row=5, column=0, sticky="w", padx=10, pady=4)
+        ctk.CTkLabel(self.advanced_left_frame, text="Series context file (Optional)").grid(row=5, column=0, sticky="w", padx=0, pady=4)
+        self.series_context_entry = ctk.CTkEntry(
+            self.advanced_left_frame,
+            textvariable=self.series_context_path_var,
+            placeholder_text="Optional local series_context.json override",
+        )
+        self.series_context_entry.grid(row=5, column=1, sticky="ew", padx=(0, 5), pady=4)
+        self.series_context_browse_btn = ctk.CTkButton(
+            self.advanced_left_frame,
+            text="Browse",
+            width=90,
+            command=self.browse_series_context_file,
+        )
+        self.series_context_browse_btn.grid(row=5, column=2, sticky="e", padx=(5, 0), pady=4)
+
+        ctk.CTkLabel(self.advanced_right_frame, text="Primary translation model").grid(row=0, column=0, sticky="w", padx=0, pady=4)
         self.translation_model_menu = ctk.CTkComboBox(
-            self.advanced_frame,
+            self.advanced_right_frame,
             values=list(TRANSLATION_MODEL_OPTIONS.keys()),
             variable=self.translation_model_var,
             state="readonly",
         )
-        self.translation_model_menu.grid(row=5, column=1, sticky="ew", padx=10, pady=4)
+        self.translation_model_menu.grid(row=0, column=1, sticky="ew", padx=0, pady=4)
 
-        ctk.CTkLabel(self.advanced_frame, text="Custom translation model (Optional)").grid(row=6, column=0, sticky="w", padx=10, pady=4)
+        ctk.CTkLabel(self.advanced_right_frame, text="Custom primary translation model (Optional)").grid(row=1, column=0, sticky="w", padx=0, pady=4)
         self.translation_model_entry = ctk.CTkEntry(
-            self.advanced_frame,
+            self.advanced_right_frame,
             textvariable=self.translation_model_custom_var,
             placeholder_text="Override with another local Ollama model name",
         )
-        self.translation_model_entry.grid(row=6, column=1, sticky="ew", padx=10, pady=4)
+        self.translation_model_entry.grid(row=1, column=1, sticky="ew", padx=0, pady=4)
+
+        ctk.CTkLabel(self.advanced_right_frame, text="Secondary translation model").grid(row=2, column=0, sticky="w", padx=0, pady=4)
+        self.secondary_translation_model_menu = ctk.CTkComboBox(
+            self.advanced_right_frame,
+            values=list(SECONDARY_TRANSLATION_MODEL_OPTIONS.keys()),
+            variable=self.secondary_translation_model_var,
+            state="readonly",
+        )
+        self.secondary_translation_model_menu.grid(row=2, column=1, sticky="ew", padx=0, pady=4)
+
+        ctk.CTkLabel(self.advanced_right_frame, text="Custom secondary model (Optional)").grid(row=3, column=0, sticky="w", padx=0, pady=4)
+        self.secondary_translation_model_entry = ctk.CTkEntry(
+            self.advanced_right_frame,
+            textvariable=self.secondary_translation_model_custom_var,
+            placeholder_text="Override the secondary candidate generator model",
+        )
+        self.secondary_translation_model_entry.grid(row=3, column=1, sticky="ew", padx=0, pady=4)
+
+        ctk.CTkLabel(self.advanced_right_frame, text="Judge / normalizer model").grid(row=4, column=0, sticky="w", padx=0, pady=4)
+        self.judge_model_menu = ctk.CTkComboBox(
+            self.advanced_right_frame,
+            values=list(JUDGE_MODEL_OPTIONS.keys()),
+            variable=self.judge_model_var,
+            state="readonly",
+        )
+        self.judge_model_menu.grid(row=4, column=1, sticky="ew", padx=0, pady=4)
+
+        ctk.CTkLabel(self.advanced_right_frame, text="Custom judge model (Optional)").grid(row=5, column=0, sticky="w", padx=0, pady=4)
+        self.judge_model_entry = ctk.CTkEntry(
+            self.advanced_right_frame,
+            textvariable=self.judge_model_custom_var,
+            placeholder_text="Override the JP/EN review model",
+        )
+        self.judge_model_entry.grid(row=5, column=1, sticky="ew", padx=0, pady=4)
+
+        ctk.CTkLabel(self.advanced_right_frame, text="Series context model").grid(row=6, column=0, sticky="w", padx=0, pady=4)
+        self.context_model_menu = ctk.CTkComboBox(
+            self.advanced_right_frame,
+            values=list(CONTEXT_MODEL_OPTIONS.keys()),
+            variable=self.context_model_var,
+            state="readonly",
+        )
+        self.context_model_menu.grid(row=6, column=1, sticky="ew", padx=0, pady=4)
+
+        ctk.CTkLabel(self.advanced_right_frame, text="Custom context model (Optional)").grid(row=7, column=0, sticky="w", padx=0, pady=4)
+        self.context_model_entry = ctk.CTkEntry(
+            self.advanced_right_frame,
+            textvariable=self.context_model_custom_var,
+            placeholder_text="Override the global series-context enrichment model",
+        )
+        self.context_model_entry.grid(row=7, column=1, sticky="ew", padx=0, pady=4)
 
         self.advanced_note = ctk.CTkLabel(
             self.advanced_frame,
-            text="Casual users can leave these defaults alone. Advanced users can switch the ASR source/model, keep the default BS-RoFormer separator preset or override it with another checkpoint filename, and choose a translation-model preset with an optional custom Ollama override. Hybrid runs Whisper first and then applies a targeted Kotoba rescue pass on suspicious windows; it is useful for A/B testing but remains experimental.",
+            text="`Current` keeps the existing fast path. `Balanced` adds dual-source ASR review plus judge-based cleanup and is the recommended automation profile. `Max Accuracy` adds the slowest full review path with a secondary translator. The series-context file is optional; if left empty, balanced/max will use the global cache and fetch or enrich it when needed.",
             justify="left",
-            wraplength=360,
+            wraplength=760,
             text_color="gray70",
         )
-        self.advanced_note.grid(row=7, column=0, columnspan=2, sticky="w", padx=10, pady=(4, 10))
+        self.advanced_note.pack(anchor="w", padx=10, pady=(4, 10))
 
         # --- BOTTOM: Console ---
         self.console = ctk.CTkTextbox(self, height=220, font=("Consolas", 12))
@@ -267,10 +442,14 @@ class AnimePipelineApp(ctk.CTk):
                 self.run_btn.configure(state="disabled")
                 self.cancel_curr_btn.configure(state="normal")
                 self.cancel_all_btn.configure(state="normal")
+                self.settings_check_btn.configure(state="disabled")
+                self.gpu_check_btn.configure(state="disabled")
             else:
                 self.run_btn.configure(state="normal")
                 self.cancel_curr_btn.configure(state="disabled")
                 self.cancel_all_btn.configure(state="disabled")
+                self.settings_check_btn.configure(state="normal")
+                self.gpu_check_btn.configure(state="normal")
         self.after(0, update)
 
     # --- ACTIONS ---
@@ -280,6 +459,14 @@ class AnimePipelineApp(ctk.CTk):
             self.selected_folder = folder
             self.folder_label.configure(text=folder)
             self.scan_for_videos()
+
+    def browse_series_context_file(self):
+        path = filedialog.askopenfilename(
+            title="Select series context file",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+        )
+        if path:
+            self.series_context_path_var.set(path)
 
     def get_selected_files(self):
         return [var.get() for _cb, var in self.checkboxes if var.get()]
@@ -356,23 +543,95 @@ class AnimePipelineApp(ctk.CTk):
         self.log_to_console("=== PIPELINE STARTED ===")
         self.log_to_console(
             "Settings: "
+            f"mode={pipeline_settings['pipeline_mode']}, "
             f"source={pipeline_settings['asr_source']}, "
             f"asr={pipeline_settings['asr_model']}, "
             f"separator={pipeline_settings['separator_model']}, "
-            f"translation={pipeline_settings['translation_model']}"
+            f"translation_primary={pipeline_settings['translation_model']}, "
+            f"translation_secondary={pipeline_settings['translation_secondary_model']}, "
+            f"judge={pipeline_settings['judge_model']}, "
+            f"context={pipeline_settings['context_model']}"
         )
         
         threading.Thread(target=self.run_queue, args=(selected_files, pipeline_settings), daemon=True).start()
 
+    def start_gpu_check(self):
+        if self.is_running:
+            messagebox.showwarning("Warning", "Please wait for the current task to finish first.")
+            return
+
+        self.is_running = True
+        self.cancel_all_flag = False
+        self.cancel_current_flag = False
+        self.current_process = None
+        self.set_buttons_state(running=True)
+        self.update_total_progress(0, 1)
+        self.log_to_console("=== GPU CHECK STARTED ===")
+        threading.Thread(target=self.run_gpu_check, daemon=True).start()
+
+    def start_settings_check(self):
+        if self.is_running:
+            messagebox.showwarning("Warning", "Please wait for the current task to finish first.")
+            return
+
+        pipeline_settings = self.get_pipeline_settings()
+
+        self.is_running = True
+        self.cancel_all_flag = False
+        self.cancel_current_flag = False
+        self.current_process = None
+        self.set_buttons_state(running=True)
+        self.update_total_progress(0, 1)
+        self.log_to_console("=== SETTINGS CHECK STARTED ===")
+        self.log_to_console(
+            "Settings: "
+            f"mode={pipeline_settings['pipeline_mode']}, "
+            f"source={pipeline_settings['asr_source']}, "
+            f"asr={pipeline_settings['asr_model']}, "
+            f"separator={pipeline_settings['separator_model']}, "
+            f"translation_primary={pipeline_settings['translation_model']}, "
+            f"translation_secondary={pipeline_settings['translation_secondary_model']}, "
+            f"judge={pipeline_settings['judge_model']}, "
+            f"context={pipeline_settings['context_model']}"
+        )
+        threading.Thread(
+            target=self.run_settings_check,
+            args=(pipeline_settings,),
+            daemon=True,
+        ).start()
+
     def get_pipeline_settings(self):
         separator_model = self.separator_model_custom_var.get().strip() or SEPARATOR_MODEL_OPTIONS[self.separator_model_var.get()]
         translation_model = self.translation_model_custom_var.get().strip() or TRANSLATION_MODEL_OPTIONS[self.translation_model_var.get()]
+        secondary_translation_model = self.secondary_translation_model_custom_var.get().strip() or SECONDARY_TRANSLATION_MODEL_OPTIONS[self.secondary_translation_model_var.get()]
+        judge_model = self.judge_model_custom_var.get().strip() or JUDGE_MODEL_OPTIONS[self.judge_model_var.get()]
+        context_model = self.context_model_custom_var.get().strip() or CONTEXT_MODEL_OPTIONS[self.context_model_var.get()]
         return {
+            "pipeline_mode": PIPELINE_MODE_OPTIONS[self.pipeline_mode_var.get()],
             "asr_source": ASR_SOURCE_OPTIONS[self.asr_source_var.get()],
             "asr_model": ASR_MODEL_OPTIONS[self.asr_model_var.get()],
             "separator_model": separator_model,
             "translation_model": translation_model,
+            "translation_secondary_model": secondary_translation_model,
+            "judge_model": judge_model,
+            "context_model": context_model,
+            "series_context_path": self.series_context_path_var.get().strip(),
         }
+
+    def get_settings_check_args(self, pipeline_settings):
+        args = [
+            "--pipeline-mode", pipeline_settings["pipeline_mode"],
+            "--asr-source", pipeline_settings["asr_source"],
+            "--asr-model", pipeline_settings["asr_model"],
+            "--separator-model", pipeline_settings["separator_model"],
+            "--translation-model", pipeline_settings["translation_model"],
+            "--translation-secondary-model", pipeline_settings["translation_secondary_model"],
+            "--judge-model", pipeline_settings["judge_model"],
+            "--context-model", pipeline_settings["context_model"],
+        ]
+        if pipeline_settings["series_context_path"]:
+            args.extend(["--series-context", pipeline_settings["series_context_path"]])
+        return args
 
     # --- PROCESS EXECUTION ---
     def get_script_label(self, script_name):
@@ -476,7 +735,7 @@ class AnimePipelineApp(ctk.CTk):
         if buffer:
             self.handle_output_line(buffer, script_name, progress_state)
 
-    def run_script(self, script_name, target_file, status_msg, extra_args=None):
+    def run_script(self, script_name, target_file=None, status_msg="Running...", extra_args=None):
         self.cancel_current_flag = False
         self.update_task_progress(0, status_text=status_msg)
         script_label = self.get_script_label(script_name)
@@ -490,7 +749,9 @@ class AnimePipelineApp(ctk.CTk):
         try:
             # TWEAK: Removed text=True and universal_newlines. 
             # bufsize=0 forces true unbuffered binary streaming.
-            command = [sys.executable, "-u", script_name, target_file]
+            command = [sys.executable, "-u", script_name]
+            if target_file:
+                command.append(target_file)
             if extra_args:
                 command.extend(extra_args)
             self.current_process = subprocess.Popen(
@@ -528,6 +789,37 @@ class AnimePipelineApp(ctk.CTk):
             self.log_to_console(f"[EXCEPTION] {str(e)}")
             return False
 
+    def run_gpu_check(self):
+        success = self.run_script(
+            "check_gpu.py",
+            status_msg="Checking GPU readiness",
+        )
+        self.current_process = None
+        self.update_total_progress(1, 1)
+        self.is_running = False
+        self.update_task_progress(0, "Idle")
+        self.set_buttons_state(running=False)
+        if success:
+            self.log_to_console("=== GPU CHECK FINISHED ===")
+        else:
+            self.log_to_console("=== GPU CHECK FAILED ===")
+
+    def run_settings_check(self, pipeline_settings):
+        success = self.run_script(
+            "check_settings.py",
+            status_msg="Validating current settings",
+            extra_args=self.get_settings_check_args(pipeline_settings),
+        )
+        self.current_process = None
+        self.update_total_progress(1, 1)
+        self.is_running = False
+        self.update_task_progress(0, "Idle")
+        self.set_buttons_state(running=False)
+        if success:
+            self.log_to_console("=== SETTINGS CHECK FINISHED ===")
+        else:
+            self.log_to_console("=== SETTINGS CHECK FAILED ===")
+
     def run_queue(self, files_to_process, pipeline_settings):
         total_files = len(files_to_process)
         self.update_total_progress(0, total_files)
@@ -544,10 +836,15 @@ class AnimePipelineApp(ctk.CTk):
 
             # 1. Process Audio
             process_audio_args = [
+                "--pipeline-mode", pipeline_settings["pipeline_mode"],
                 "--asr-source", pipeline_settings["asr_source"],
                 "--asr-model", pipeline_settings["asr_model"],
                 "--separator-model", pipeline_settings["separator_model"],
+                "--judge-model", pipeline_settings["judge_model"],
+                "--context-model", pipeline_settings["context_model"],
             ]
+            if pipeline_settings["series_context_path"]:
+                process_audio_args.extend(["--series-context", pipeline_settings["series_context_path"]])
             success = self.run_script(
                 "process_audio.py",
                 full_path,
@@ -564,8 +861,14 @@ class AnimePipelineApp(ctk.CTk):
             # 2. Translate Subtitles (only if not skipping current)
             if not self.cancel_current_flag:
                 translate_args = [
+                    "--pipeline-mode", pipeline_settings["pipeline_mode"],
                     "--translation-model", pipeline_settings["translation_model"],
+                    "--translation-secondary-model", pipeline_settings["translation_secondary_model"],
+                    "--judge-model", pipeline_settings["judge_model"],
+                    "--context-model", pipeline_settings["context_model"],
                 ]
+                if pipeline_settings["series_context_path"]:
+                    translate_args.extend(["--series-context", pipeline_settings["series_context_path"]])
                 self.run_script(
                     "translate_subs.py",
                     json_path,
